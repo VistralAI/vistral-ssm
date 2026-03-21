@@ -1,0 +1,129 @@
+schemaVersion: "2.2"
+description: |
+  Detect Apple T2 hardware and install T2 Linux kernel + fan daemon.
+  Triggered automatically by EventBridge when a new instance registers with SSM.
+
+  This document:
+  1. Detects T2 hardware via DMI, apple_smc, and PCI ID
+  2. Installs T2 Linux kernel from community APT repo
+  3. Configures GRUB with intel_iommu=on
+  4. Installs t2fanrd for thermal management
+  5. Reboots to apply new kernel
+
+  Guard: If T2 kernel is already installed, exits cleanly.
+
+parameters:
+  LogPath:
+    type: String
+    description: "Path to write bootstrap log"
+    default: "/var/log/vistral-t2-bootstrap.log"
+
+mainSteps:
+  - action: aws:runShellScript
+    name: bootstrapT2Hardware
+    inputs:
+      timeoutSeconds: 600
+      runCommand:
+        - |
+          #!/bin/bash
+          set -ex
+
+          LOG="{{LogPath}}"
+          exec > >(tee -a "$LOG") 2>&1
+
+          echo "=============================================="
+          echo "T2 Hardware Bootstrap - $(date)"
+          echo "=============================================="
+
+          # Guard: skip if T2 kernel already installed
+          if dpkg -l | grep -q "linux-t2-lts"; then
+              echo "T2 kernel already installed. Skipping."
+              exit 0
+          fi
+
+          # Detect T2 hardware
+          detect_t2() {
+              if ! command -v dmidecode &> /dev/null; then
+                  apt-get update && apt-get install -y dmidecode
+              fi
+
+              # Method 1: DMI system manufacturer
+              if dmidecode -t system | grep -q "Manufacturer: Apple Inc."; then
+                  local MODEL=$(dmidecode -t system | grep "Product Name" | cut -d: -f2 | xargs)
+                  echo "Detected Apple hardware: $MODEL"
+                  case "$MODEL" in
+                      "MacBookAir8"*|"MacBookAir9"*|\
+                      "MacBookPro15"*|"MacBookPro16"*|\
+                      "Macmini8"*|"iMacPro1"*|\
+                      "MacPro7"*|"iMac20"*)
+                          echo "Confirmed T2 model: $MODEL"
+                          return 0
+                          ;;
+                  esac
+              fi
+
+              # Method 2: Apple SMC directory
+              if [ -d /sys/class/apple_smc ]; then
+                  echo "T2 detected via apple_smc"
+                  return 0
+              fi
+
+              # Method 3: T2 PCI device ID
+              if lspci -n 2>/dev/null | grep -q "106b:1801"; then
+                  echo "T2 detected via PCI ID"
+                  return 0
+              fi
+
+              echo "No T2 hardware detected"
+              return 1
+          }
+
+          if ! detect_t2; then
+              echo "Standard hardware. Installing base packages only."
+              apt-get update && apt-get install -y curl unzip jq
+              exit 0
+          fi
+
+          # Detect Ubuntu codename
+          if [ -f /etc/lsb-release ]; then
+              . /etc/lsb-release
+              CODENAME=$DISTRIB_CODENAME
+          else
+              CODENAME=$(grep -oP "VERSION_CODENAME=\K\w+" /etc/os-release)
+          fi
+          echo "Ubuntu codename: $CODENAME"
+
+          # Install prerequisites
+          apt-get update
+          apt-get install -y curl unzip jq apt-transport-https ca-certificates gnupg
+
+          # Add T2 Linux APT repository
+          echo "Adding T2 Linux repository..."
+          curl -s --compressed "https://adityagarg8.github.io/t2-ubuntu-repo/KEY.gpg" \
+              | gpg --dearmor | tee /etc/apt/trusted.gpg.d/t2-ubuntu-repo.gpg >/dev/null
+          curl -s --compressed -o /etc/apt/sources.list.d/t2.list \
+              "https://adityagarg8.github.io/t2-ubuntu-repo/t2.list"
+          echo "deb [signed-by=/etc/apt/trusted.gpg.d/t2-ubuntu-repo.gpg] https://github.com/AdityaGarg8/t2-ubuntu-repo/releases/download/${CODENAME} ./" \
+              | tee -a /etc/apt/sources.list.d/t2.list
+
+          apt-get update
+
+          # Install T2 kernel
+          echo "Installing T2 Linux kernel..."
+          apt-get install -y linux-t2-lts
+
+          # Configure GRUB
+          echo "Configuring GRUB for T2 hardware..."
+          if ! grep -q "intel_iommu=on" /etc/default/grub; then
+              sed -i 's/GRUB_CMDLINE_LINUX="/GRUB_CMDLINE_LINUX="intel_iommu=on /' /etc/default/grub
+          fi
+          update-grub
+
+          # Install fan daemon
+          echo "Installing t2fanrd..."
+          apt-get install -y t2fanrd
+
+          echo "=============================================="
+          echo "T2 bootstrap complete. Rebooting at $(date)"
+          echo "=============================================="
+          reboot

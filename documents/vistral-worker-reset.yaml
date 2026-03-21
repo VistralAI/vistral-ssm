@@ -1,0 +1,141 @@
+schemaVersion: "2.2"
+description: |
+  Reset a worker node for rebuild. The node drains itself, resets kubeadm,
+  and deregisters from the cluster. After reset, the State Manager association
+  will automatically re-join it via vistral-k8s-join on the next 30-minute cycle.
+
+  Triggered manually (on-demand) when a worker needs to be rebuilt.
+
+  This document:
+  1. Verifies the node is a worker (refuses to reset control planes)
+  2. Cordons and drains itself
+  3. Deletes itself from the cluster
+  4. Resets kubeadm, containerd, and networking
+  5. Cleans up K8s artifacts
+  6. Node will auto-rejoin on next State Manager run
+
+parameters:
+  AWSRegion:
+    type: String
+    description: "AWS region"
+    default: "us-east-1"
+  Force:
+    type: String
+    description: "Force reset even if drain fails"
+    default: "false"
+    allowedValues:
+      - "true"
+      - "false"
+
+mainSteps:
+  - action: aws:runShellScript
+    name: resetWorker
+    inputs:
+      timeoutSeconds: 600
+      runCommand:
+        - |
+          #!/bin/bash
+          set -e
+
+          export HOME=/root
+          AWS_REGION="{{AWSRegion}}"
+          FORCE="{{Force}}"
+
+          LOG="/var/log/vistral-worker-reset.log"
+          exec > >(tee -a "$LOG") 2>&1
+
+          echo "=============================================="
+          echo "Worker Reset - $(date)"
+          echo "=============================================="
+
+          HOSTNAME=$(hostname | tr '[:upper:]' '[:lower:]')
+          echo "Hostname: $HOSTNAME"
+
+          # Safety: refuse to reset control planes
+          if [[ "$HOSTNAME" =~ ^vausk[0-9]+$ ]]; then
+              echo "ERROR: Refusing to reset control plane node $HOSTNAME"
+              echo "Control plane reset requires manual intervention."
+              exit 1
+          fi
+
+          # Verify this is a K8s node
+          if [ ! -f /etc/kubernetes/kubelet.conf ]; then
+              echo "Node is not part of a cluster. Nothing to reset."
+              exit 0
+          fi
+
+          # Get admin kubeconfig from Secrets Manager for cluster operations
+          if ! command -v aws &>/dev/null; then
+              cd /tmp
+              curl -sL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+              unzip -q awscliv2.zip
+              ./aws/install --update
+              rm -rf awscliv2.zip aws
+              cd -
+          fi
+
+          ADMIN_CONFIG=$(aws secretsmanager get-secret-value \
+              --secret-id "vistral-k8s-admin-config" \
+              --region "$AWS_REGION" \
+              --query SecretString \
+              --output text 2>/dev/null || echo "")
+
+          if [ -n "$ADMIN_CONFIG" ] && [ "$ADMIN_CONFIG" != "{}" ]; then
+              TEMP_KUBECONFIG=$(mktemp)
+              echo "$ADMIN_CONFIG" > "$TEMP_KUBECONFIG"
+              chmod 600 "$TEMP_KUBECONFIG"
+
+              # Cordon and drain
+              echo "Cordoning node..."
+              KUBECONFIG="$TEMP_KUBECONFIG" kubectl cordon "$HOSTNAME" 2>/dev/null || true
+
+              echo "Draining node..."
+              if ! KUBECONFIG="$TEMP_KUBECONFIG" kubectl drain "$HOSTNAME" \
+                  --delete-emptydir-data \
+                  --force \
+                  --ignore-daemonsets \
+                  --timeout=120s 2>/dev/null; then
+                  if [ "$FORCE" = "true" ]; then
+                      echo "WARNING: Drain failed, continuing with force"
+                  else
+                      echo "ERROR: Drain failed. Use Force=true to override."
+                      rm -f "$TEMP_KUBECONFIG"
+                      exit 1
+                  fi
+              fi
+
+              # Delete node from cluster
+              echo "Deleting node from cluster..."
+              KUBECONFIG="$TEMP_KUBECONFIG" kubectl delete node "$HOSTNAME" --force 2>/dev/null || true
+
+              rm -f "$TEMP_KUBECONFIG"
+          else
+              echo "WARNING: No admin kubeconfig available. Resetting locally only."
+          fi
+
+          # Reset kubeadm
+          echo "Resetting kubeadm..."
+          kubeadm reset -f 2>/dev/null || true
+
+          # Clean up networking
+          echo "Cleaning up networking..."
+          ip link delete cni0 2>/dev/null || true
+          ip link delete flannel.1 2>/dev/null || true
+          ip link delete tunl0 2>/dev/null || true
+          iptables -F 2>/dev/null || true
+          iptables -t nat -F 2>/dev/null || true
+          iptables -t mangle -F 2>/dev/null || true
+          iptables -X 2>/dev/null || true
+
+          # Clean up K8s artifacts
+          echo "Cleaning up K8s artifacts..."
+          rm -rf /etc/kubernetes/ /var/lib/kubelet/ /var/lib/etcd/ /etc/cni/net.d/
+          rm -rf $HOME/.kube/
+
+          # Restart containerd
+          systemctl restart containerd 2>/dev/null || true
+
+          echo "=============================================="
+          echo "Worker reset complete at $(date)"
+          echo "Node will auto-rejoin on next State Manager cycle (30 min)"
+          echo "=============================================="

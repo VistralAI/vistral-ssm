@@ -1,0 +1,119 @@
+schemaVersion: "2.2"
+description: |
+  Label and taint cluster nodes based on hostname and hardware detection.
+  - Control planes: labeled with node-type=control-plane
+  - Workers (vausw): labeled with node-type=worker, hardware=macpro, gpu=true
+  - Workers (vausm): labeled with node-type=worker, hardware=macmini
+
+  GPU workers are tainted so only GPU workloads schedule on them.
+
+  Guard: Skips if labels already applied.
+
+parameters:
+  AWSRegion:
+    type: String
+    description: "AWS region"
+    default: "us-east-1"
+
+mainSteps:
+  - action: aws:runShellScript
+    name: labelNode
+    inputs:
+      timeoutSeconds: 300
+      runCommand:
+        - |
+          #!/bin/bash
+          set -e
+
+          LOG="/var/log/vistral-node-label.log"
+          exec > >(tee -a "$LOG") 2>&1
+
+          echo "=============================================="
+          echo "Node Labeling - $(date)"
+          echo "=============================================="
+
+          HOSTNAME=$(hostname | tr '[:upper:]' '[:lower:]')
+          echo "Hostname: $HOSTNAME"
+
+          # Must be in cluster
+          if [ ! -f /etc/kubernetes/kubelet.conf ]; then
+              echo "Not in a cluster yet. Skipping."
+              exit 0
+          fi
+
+          # Need kubectl access
+          if [ -f /etc/kubernetes/admin.conf ]; then
+              export KUBECONFIG=/etc/kubernetes/admin.conf
+          else
+              # Workers don't have admin.conf — label via SSM on a control plane
+              # or use kubelet client cert. For now, skip on workers.
+              echo "No admin kubeconfig available. Node will be labeled by control plane."
+              exit 0
+          fi
+
+          # Guard: check if already labeled
+          EXISTING=$(kubectl get node "$HOSTNAME" -o jsonpath='{.metadata.labels.vistral\.ai/node-type}' 2>/dev/null || echo "")
+          if [ -n "$EXISTING" ]; then
+              echo "Node already labeled: node-type=$EXISTING. Skipping."
+              exit 0
+          fi
+
+          # Detect hardware
+          HAS_GPU=false
+          if command -v lspci &>/dev/null; then
+              if lspci | grep -qi "nvidia"; then
+                  HAS_GPU=true
+                  GPU_MODEL=$(lspci | grep -i nvidia | head -1 | sed 's/.*: //')
+                  echo "GPU detected: $GPU_MODEL"
+              fi
+          fi
+
+          # Detect Apple hardware model
+          HARDWARE="unknown"
+          if command -v dmidecode &>/dev/null; then
+              MODEL=$(dmidecode -t system 2>/dev/null | grep "Product Name" | cut -d: -f2 | xargs)
+              case "$MODEL" in
+                  MacPro*) HARDWARE="macpro" ;;
+                  Macmini*) HARDWARE="macmini" ;;
+                  *) HARDWARE="generic" ;;
+              esac
+          fi
+
+          echo "Hardware: $HARDWARE, GPU: $HAS_GPU"
+
+          # Apply labels based on hostname pattern
+          if [[ "$HOSTNAME" =~ ^vausk[0-9]+$ ]]; then
+              echo "Labeling as control plane..."
+              kubectl label node "$HOSTNAME" \
+                  vistral.ai/node-type=control-plane \
+                  vistral.ai/hardware=$HARDWARE \
+                  --overwrite
+
+          elif [[ "$HOSTNAME" =~ ^vausw[0-9]+$ ]]; then
+              echo "Labeling as GPU worker..."
+              kubectl label node "$HOSTNAME" \
+                  vistral.ai/node-type=worker \
+                  vistral.ai/hardware=$HARDWARE \
+                  vistral.ai/gpu=$HAS_GPU \
+                  --overwrite
+
+              # Taint GPU workers so only GPU workloads schedule on them
+              if [ "$HAS_GPU" = "true" ]; then
+                  kubectl taint nodes "$HOSTNAME" \
+                      nvidia.com/gpu=present:NoSchedule \
+                      --overwrite 2>/dev/null || true
+                  echo "GPU taint applied"
+              fi
+
+          elif [[ "$HOSTNAME" =~ ^vausm[0-9]+$ ]]; then
+              echo "Labeling as Mac Mini worker..."
+              kubectl label node "$HOSTNAME" \
+                  vistral.ai/node-type=worker \
+                  vistral.ai/hardware=macmini \
+                  vistral.ai/gpu=false \
+                  --overwrite
+          fi
+
+          echo "=============================================="
+          echo "Node labeling complete at $(date)"
+          echo "=============================================="

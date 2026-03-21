@@ -1,0 +1,646 @@
+schemaVersion: "2.2"
+description: |
+  Auto-join Kubernetes cluster based on hostname convention.
+  - VAUSKxx hostnames -> Control plane nodes
+  - VAUSWxx hostnames -> Worker nodes (standard servers)
+  - VAUSMxx hostnames -> Worker nodes (Mac Minis)
+
+  This document:
+  1. Detects node role from hostname
+  2. Clones vistral-cluster from GitHub
+  3. Checks if cluster exists
+  4. Joins existing cluster or initializes new one (if vausk01 and no cluster)
+
+parameters:
+  DeployKeySecretName:
+    type: String
+    description: "AWS Secrets Manager secret name containing GitHub deploy key"
+    default: "vistral-github-deploy-key"
+  JoinTokenSecretName:
+    type: String
+    description: "AWS Secrets Manager secret name for join tokens"
+    default: "vistral-k8s-join-token"
+  VipAddress:
+    type: String
+    description: "Virtual IP address for the Kubernetes API"
+    default: "192.168.1.204"
+  GitHubRepo:
+    type: String
+    description: "GitHub repository URL (SSH format)"
+    default: "git@github.com:VistralAI/vistral-cluster.git"
+  AWSRegion:
+    type: String
+    description: "AWS region for Secrets Manager"
+    default: "us-east-1"
+
+mainSteps:
+  - action: aws:runShellScript
+    name: autoJoinCluster
+    inputs:
+      timeoutSeconds: 1800
+      runCommand:
+        - |
+          #!/bin/bash
+          set -e
+
+          # Ensure HOME is set for tilde expansion (SSM agent may not set it)
+          export HOME=/root
+
+          # Configuration from parameters
+          DEPLOY_KEY_SECRET="{{DeployKeySecretName}}"
+          JOIN_TOKEN_SECRET="{{JoinTokenSecretName}}"
+          VIP_ADDRESS="{{VipAddress}}"
+          GITHUB_REPO="{{GitHubRepo}}"
+          AWS_REGION="{{AWSRegion}}"
+
+          # Logging setup
+          LOG="/var/log/k8s-auto-join.log"
+          exec > >(tee -a "$LOG") 2>&1
+
+          echo "=============================================="
+          echo "Kubernetes Auto-Join - $(date)"
+          echo "=============================================="
+
+          HOSTNAME=$(hostname | tr '[:upper:]' '[:lower:]')
+          echo "Hostname: $HOSTNAME"
+
+          # Smart guard: detect healthy vs broken node state
+          if [ -f /etc/kubernetes/kubelet.conf ]; then
+              echo "Found existing kubelet.conf. Checking node health..."
+
+              NEEDS_RESET=false
+
+              # Check 1: Is kubelet running?
+              if ! systemctl is-active --quiet kubelet 2>/dev/null; then
+                  echo "Kubelet is not running"
+                  NEEDS_RESET=true
+              fi
+
+              # Check 2: Can kubelet reach the API server?
+              if [ "$NEEDS_RESET" = "false" ]; then
+                  export KUBECONFIG=/etc/kubernetes/kubelet.conf
+                  if ! kubectl get nodes "$HOSTNAME" --request-timeout=10s &>/dev/null 2>&1; then
+                      # Try admin.conf if kubelet.conf fails (control plane)
+                      if [ -f /etc/kubernetes/admin.conf ]; then
+                          export KUBECONFIG=/etc/kubernetes/admin.conf
+                          if ! kubectl get nodes "$HOSTNAME" --request-timeout=10s &>/dev/null 2>&1; then
+                              echo "Cannot reach API server with any kubeconfig"
+                              NEEDS_RESET=true
+                          fi
+                      else
+                          echo "Cannot reach API server"
+                          NEEDS_RESET=true
+                      fi
+                  fi
+              fi
+
+              # Check 3: Is this node actually Ready?
+              if [ "$NEEDS_RESET" = "false" ]; then
+                  NODE_STATUS=$(kubectl get node "$HOSTNAME" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || echo "Unknown")
+                  if [ "$NODE_STATUS" = "True" ]; then
+                      echo "Node is healthy and Ready. Skipping auto-join."
+                      exit 0
+                  else
+                      echo "Node exists but status is: Ready=$NODE_STATUS"
+                      NEEDS_RESET=true
+                  fi
+              fi
+
+              # Check 4: Are certs expired?
+              if [ "$NEEDS_RESET" = "false" ] && [ -f /etc/kubernetes/pki/apiserver.crt ]; then
+                  if ! openssl x509 -in /etc/kubernetes/pki/apiserver.crt -noout -checkend 0 2>/dev/null; then
+                      echo "API server certificate is expired"
+                      NEEDS_RESET=true
+                  fi
+              fi
+
+              if [ "$NEEDS_RESET" = "true" ]; then
+                  echo "=============================================="
+                  echo "STALE/BROKEN NODE DETECTED — AUTO-RESETTING"
+                  echo "=============================================="
+
+                  # Reset kubeadm
+                  kubeadm reset -f 2>/dev/null || true
+
+                  # Clean up networking
+                  ip link delete cni0 2>/dev/null || true
+                  ip link delete flannel.1 2>/dev/null || true
+                  ip link delete tunl0 2>/dev/null || true
+                  iptables -F 2>/dev/null || true
+                  iptables -t nat -F 2>/dev/null || true
+                  iptables -t mangle -F 2>/dev/null || true
+                  iptables -X 2>/dev/null || true
+
+                  # Clean up K8s artifacts
+                  rm -rf /etc/kubernetes/ /var/lib/kubelet/ /var/lib/etcd/ /etc/cni/net.d/
+                  rm -rf $HOME/.kube/
+
+                  # Restart containerd
+                  systemctl restart containerd 2>/dev/null || true
+
+                  echo "Reset complete. Proceeding with fresh join..."
+              fi
+          fi
+
+          # Determine role from hostname
+          if [[ "$HOSTNAME" =~ ^vausk[0-9]+$ ]]; then
+              ROLE="control-plane"
+              NODE_NUM="${HOSTNAME//[!0-9]/}"
+              # Pad to 2 digits for comparison
+              NODE_NUM=$(printf "%02d" "$NODE_NUM")
+              echo "Detected role: Control Plane (node $NODE_NUM)"
+          elif [[ "$HOSTNAME" =~ ^vausw[0-9]+$ ]]; then
+              ROLE="worker"
+              NODE_NUM="${HOSTNAME//[!0-9]/}"
+              NODE_NUM=$(printf "%02d" "$NODE_NUM")
+              echo "Detected role: Worker (node $NODE_NUM)"
+          elif [[ "$HOSTNAME" =~ ^vausm[0-9]+$ ]]; then
+              ROLE="worker"
+              NODE_NUM="${HOSTNAME//[!0-9]/}"
+              NODE_NUM=$(printf "%02d" "$NODE_NUM")
+              echo "Detected role: Worker - Mac Mini (node $NODE_NUM)"
+          else
+              echo "ERROR: Unknown hostname pattern: $HOSTNAME"
+              echo "Expected patterns: vauskXX (control plane), vauswXX (worker), or vausmXX (Mac Mini worker)"
+              exit 1
+          fi
+
+          # Install prerequisites
+          echo "Installing prerequisites..."
+          apt-get update
+          apt-get install -y git jq curl unzip
+
+          # Install AWS CLI v2 (awscli package not available in Ubuntu 24.04)
+          if ! command -v aws &> /dev/null; then
+              echo "Installing AWS CLI v2..."
+              cd /tmp
+              curl -sL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+              unzip -q awscliv2.zip
+              ./aws/install --update
+              rm -rf awscliv2.zip aws
+              cd -
+          fi
+          echo "AWS CLI version: $(aws --version 2>&1 | head -1)"
+
+          # Get deploy key from Secrets Manager
+          echo "Retrieving GitHub deploy key from Secrets Manager..."
+          DEPLOY_KEY=$(aws secretsmanager get-secret-value \
+              --secret-id "$DEPLOY_KEY_SECRET" \
+              --region "$AWS_REGION" \
+              --query SecretString \
+              --output text 2>/dev/null) || {
+              echo "ERROR: Failed to retrieve deploy key from Secrets Manager"
+              echo "Ensure secret '$DEPLOY_KEY_SECRET' exists and IAM permissions are configured"
+              exit 1
+          }
+
+          # Setup SSH for git
+          echo "Configuring SSH for GitHub access..."
+          mkdir -p ~/.ssh
+          echo "$DEPLOY_KEY" > ~/.ssh/github_deploy
+          chmod 600 ~/.ssh/github_deploy
+          ssh-keyscan github.com >> ~/.ssh/known_hosts 2>/dev/null
+          export GIT_SSH_COMMAND="ssh -i ~/.ssh/github_deploy -o StrictHostKeyChecking=no"
+
+          # Clone vistral-cluster
+          echo "Cloning vistral-cluster repository..."
+          rm -rf /opt/vistral-cluster
+          git clone "$GITHUB_REPO" /opt/vistral-cluster || {
+              echo "ERROR: Failed to clone repository"
+              rm -f ~/.ssh/github_deploy
+              exit 1
+          }
+
+          cd /opt/vistral-cluster
+          chmod +x *.sh scripts/*.sh
+
+          # Source configuration
+          source ./config.sh
+
+          # Check if cluster exists by querying the VIP
+          echo "Checking if cluster exists at VIP $VIP_ADDRESS..."
+          CLUSTER_EXISTS=false
+          if curl -sk --connect-timeout 5 --max-time 10 "https://${VIP_ADDRESS}:6443/healthz" 2>/dev/null | grep -q "ok"; then
+              CLUSTER_EXISTS=true
+              echo "Cluster found and healthy at $VIP_ADDRESS"
+          else
+              echo "No healthy cluster found at $VIP_ADDRESS"
+          fi
+
+          # Function to get or request join token
+          # Returns JSON on stdout, logs to stderr
+          get_join_token() {
+              echo "Checking for existing join token..." >&2
+              local TOKEN_JSON=$(aws secretsmanager get-secret-value \
+                  --secret-id "$JOIN_TOKEN_SECRET" \
+                  --region "$AWS_REGION" \
+                  --query SecretString \
+                  --output text 2>/dev/null || echo "")
+
+              if [ -n "$TOKEN_JSON" ]; then
+                  # Check if token is expired
+                  local EXPIRES_AT=$(echo "$TOKEN_JSON" | jq -r '.expiresAt // empty')
+                  if [ -n "$EXPIRES_AT" ]; then
+                      local EXPIRES_EPOCH=$(date -d "$EXPIRES_AT" +%s 2>/dev/null || echo "0")
+                      local NOW_EPOCH=$(date +%s)
+                      if [ "$NOW_EPOCH" -lt "$EXPIRES_EPOCH" ]; then
+                          echo "Found valid join token (expires: $EXPIRES_AT)" >&2
+                          echo "$TOKEN_JSON"
+                          return 0
+                      else
+                          echo "Join token expired, requesting new one..." >&2
+                      fi
+                  fi
+              fi
+
+              # Get list of available control plane instances (excluding self)
+              echo "Finding available control planes for token generation..." >&2
+              local MY_INSTANCE_ID=$(curl -s --connect-timeout 2 http://169.254.169.254/latest/meta-data/instance-id 2>/dev/null || echo "")
+
+              # Try to find online control planes via SSM inventory
+              local AVAILABLE_CPS=$(aws ssm describe-instance-information \
+                  --filters "Key=tag:k8s-role,Values=control-plane" \
+                  --query "InstanceInformationList[?PingStatus=='Online'].InstanceId" \
+                  --region "$AWS_REGION" \
+                  --output text 2>/dev/null | tr '\t' '\n' | grep -v "^$MY_INSTANCE_ID$" | head -3)
+
+              if [ -n "$AVAILABLE_CPS" ]; then
+                  echo "Found available control planes: $(echo $AVAILABLE_CPS | tr '\n' ' ')" >&2
+                  # Try each control plane until one succeeds
+                  for CP in $AVAILABLE_CPS; do
+                      echo "Requesting token from $CP..." >&2
+                      if aws ssm send-command \
+                          --document-name "vistral-k8s-generate-token" \
+                          --instance-ids "$CP" \
+                          --region "$AWS_REGION" \
+                          --comment "Token request from $HOSTNAME" >&2 2>/dev/null; then
+                          echo "Token request sent to $CP" >&2
+                          break
+                      fi
+                  done
+              else
+                  # Fallback to tag-based targeting
+                  echo "Using tag-based targeting for token generation..." >&2
+                  aws ssm send-command \
+                      --document-name "vistral-k8s-generate-token" \
+                      --targets "Key=tag:k8s-role,Values=control-plane" \
+                      --region "$AWS_REGION" \
+                      --max-concurrency "1" \
+                      --comment "Token request from $HOSTNAME" >&2 || {
+                      echo "WARNING: Failed to send token generation command" >&2
+                  }
+              fi
+
+              # Wait for token to be generated
+              echo "Waiting for token generation (up to 5 minutes)..." >&2
+              for i in {1..30}; do
+                  sleep 10
+                  TOKEN_JSON=$(aws secretsmanager get-secret-value \
+                      --secret-id "$JOIN_TOKEN_SECRET" \
+                      --region "$AWS_REGION" \
+                      --query SecretString \
+                      --output text 2>/dev/null || echo "")
+
+                  if [ -n "$TOKEN_JSON" ]; then
+                      local GENERATED_AT=$(echo "$TOKEN_JSON" | jq -r '.generatedAt // empty')
+                      if [ -n "$GENERATED_AT" ]; then
+                          echo "Join token received (generated: $GENERATED_AT)" >&2
+                          echo "$TOKEN_JSON"
+                          return 0
+                      fi
+                  fi
+                  echo "  Waiting... ($((i*10))s)" >&2
+              done
+
+              echo "ERROR: Timeout waiting for join token" >&2
+              return 1
+          }
+
+          # Run prerequisites scripts
+          run_prerequisites() {
+              echo "Running prerequisite scripts..."
+
+              echo "  -> prerequisites.sh"
+              sudo ./scripts/prerequisites.sh
+
+              echo "  -> container-runtime.sh"
+              sudo ./scripts/container-runtime.sh
+
+              echo "  -> kubernetes.sh"
+              sudo ./scripts/kubernetes.sh
+          }
+
+          # Function to cleanup stale node from previous installation
+          # This enables automatic rebuilds without manual intervention
+          cleanup_stale_node() {
+              echo "Checking for stale node entry in cluster..."
+
+              # Get admin kubeconfig from Secrets Manager
+              ADMIN_CONFIG=$(aws secretsmanager get-secret-value \
+                  --secret-id "vistral-k8s-admin-config" \
+                  --region "$AWS_REGION" \
+                  --query SecretString \
+                  --output text 2>/dev/null || echo "")
+
+              if [ -z "$ADMIN_CONFIG" ] || [ "$ADMIN_CONFIG" = "{}" ]; then
+                  echo "No admin config available in Secrets Manager, skipping cleanup check"
+                  return 0
+              fi
+
+              # Write kubeconfig to temp file
+              TEMP_KUBECONFIG=$(mktemp)
+              echo "$ADMIN_CONFIG" > "$TEMP_KUBECONFIG"
+              chmod 600 "$TEMP_KUBECONFIG"
+
+              # Check if this node exists in the cluster
+              if KUBECONFIG="$TEMP_KUBECONFIG" kubectl get node "$HOSTNAME" &>/dev/null; then
+                  NODE_STATUS=$(KUBECONFIG="$TEMP_KUBECONFIG" kubectl get node "$HOSTNAME" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || echo "Unknown")
+
+                  if [ "$NODE_STATUS" != "True" ]; then
+                      echo "Found stale node $HOSTNAME (Ready=$NODE_STATUS), removing..."
+
+                      # Drain the node (ignore errors - node is likely not responding)
+                      KUBECONFIG="$TEMP_KUBECONFIG" kubectl drain "$HOSTNAME" \
+                          --delete-emptydir-data \
+                          --force \
+                          --ignore-daemonsets \
+                          --timeout=60s 2>/dev/null || true
+
+                      # Delete the node
+                      KUBECONFIG="$TEMP_KUBECONFIG" kubectl delete node "$HOSTNAME" --force 2>/dev/null || true
+
+                      echo "Stale node $HOSTNAME removed from cluster"
+
+                      # For control planes, etcd cleanup happens automatically via kubeadm join
+                      # kubeadm will detect the orphaned member and handle it
+                      if [ "$ROLE" = "control-plane" ]; then
+                          echo "Note: etcd member cleanup will be handled by kubeadm during join"
+                      fi
+
+                      # Wait for cleanup to propagate
+                      sleep 15
+                  else
+                      echo "ERROR: Node $HOSTNAME exists and is Ready - refusing to rebuild an active node"
+                      echo "If you really want to rebuild this node, drain and delete it first:"
+                      echo "  kubectl drain $HOSTNAME --delete-emptydir-data --force --ignore-daemonsets"
+                      echo "  kubectl delete node $HOSTNAME"
+                      rm -f "$TEMP_KUBECONFIG"
+                      exit 1
+                  fi
+              else
+                  echo "No existing node entry found for $HOSTNAME"
+              fi
+
+              rm -f "$TEMP_KUBECONFIG"
+          }
+
+          # Main logic based on role and cluster state
+          if [ "$ROLE" = "control-plane" ]; then
+              # For existing clusters, cleanup any stale node entry before joining
+              if [ "$CLUSTER_EXISTS" = "true" ]; then
+                  cleanup_stale_node
+              fi
+
+              if [ "$CLUSTER_EXISTS" = "false" ] && [ "$NODE_NUM" = "01" ]; then
+                  # First control plane - initialize cluster
+                  echo "=============================================="
+                  echo "INITIALIZING NEW CLUSTER"
+                  echo "=============================================="
+                  echo "This is vausk01 and no existing cluster found."
+                  echo "Initializing new Kubernetes cluster..."
+
+                  # Run prerequisites first (containerd, kubeadm, kubelet, kubectl)
+                  run_prerequisites
+
+                  sudo ./setup-ha-kubernetes.sh
+
+                  echo "Cluster initialization complete!"
+
+                  # Store join token in Secrets Manager for other nodes to use
+                  echo "Generating and storing join token in Secrets Manager..."
+
+                  # Setup kubectl for root
+                  export KUBECONFIG=/etc/kubernetes/admin.conf
+
+                  # Generate certificate key for control plane joining
+                  CERT_KEY=$(sudo kubeadm init phase upload-certs --upload-certs 2>/dev/null | tail -1)
+
+                  # Generate join command
+                  JOIN_CMD=$(sudo kubeadm token create --print-join-command)
+
+                  # Calculate expiration (24 hours from now)
+                  EXPIRES_AT=$(date -d "+24 hours" -Iseconds)
+                  GENERATED_AT=$(date -Iseconds)
+
+                  # Create JSON payload using jq to properly escape values
+                  JOIN_TOKEN_JSON=$(jq -n \
+                      --arg joinCommand "$JOIN_CMD" \
+                      --arg certKey "$CERT_KEY" \
+                      --arg generatedAt "$GENERATED_AT" \
+                      --arg expiresAt "$EXPIRES_AT" \
+                      --arg generatedBy "$HOSTNAME" \
+                      '$ARGS.named')
+
+                  # Store in Secrets Manager
+                  if aws secretsmanager put-secret-value \
+                      --secret-id "$JOIN_TOKEN_SECRET" \
+                      --secret-string "$JOIN_TOKEN_JSON" \
+                      --region "$AWS_REGION"; then
+                      echo "Join token stored in Secrets Manager"
+                  else
+                      echo "WARNING: Failed to store join token - other nodes may need manual token generation"
+                  fi
+
+                  # Store admin kubeconfig in Secrets Manager for node rebuild operations
+                  echo "Storing admin kubeconfig in Secrets Manager for future node rebuilds..."
+                  ADMIN_CONFIG=$(cat /etc/kubernetes/admin.conf)
+                  if aws secretsmanager put-secret-value \
+                      --secret-id "vistral-k8s-admin-config" \
+                      --secret-string "$ADMIN_CONFIG" \
+                      --region "$AWS_REGION" 2>/dev/null; then
+                      echo "Admin kubeconfig stored in Secrets Manager"
+                  else
+                      # Secret might not exist, try to create it
+                      if aws secretsmanager create-secret \
+                          --name "vistral-k8s-admin-config" \
+                          --description "Kubernetes admin kubeconfig for node rebuild operations" \
+                          --secret-string "$ADMIN_CONFIG" \
+                          --region "$AWS_REGION" 2>/dev/null; then
+                          echo "Admin kubeconfig secret created and stored"
+                      else
+                          echo "WARNING: Failed to store admin kubeconfig - node rebuilds may require manual cleanup"
+                      fi
+                  fi
+
+              else
+                  # Additional control plane - join existing cluster
+                  echo "=============================================="
+                  echo "JOINING AS ADDITIONAL CONTROL PLANE"
+                  echo "=============================================="
+
+                  if [ "$CLUSTER_EXISTS" = "false" ]; then
+                      echo "ERROR: Cannot join - no cluster found at $VIP_ADDRESS"
+                      echo "Either vausk01 hasn't initialized the cluster yet,"
+                      echo "or the cluster is down."
+                      exit 1
+                  fi
+
+                  # Get join token
+                  JOIN_INFO=$(get_join_token) || exit 1
+
+                  JOIN_CMD=$(echo "$JOIN_INFO" | jq -r '.joinCommand')
+                  CERT_KEY=$(echo "$JOIN_INFO" | jq -r '.certKey')
+
+                  if [ -z "$JOIN_CMD" ] || [ "$JOIN_CMD" = "null" ]; then
+                      echo "ERROR: Invalid join command in token"
+                      exit 1
+                  fi
+
+                  # Run prerequisites (need kubectl for cert refresh)
+                  run_prerequisites
+
+                  # Check if certificate key is valid by attempting to verify kubeadm-certs secret
+                  # The kubeadm-certs secret expires after 2 hours, while join token lasts 24 hours
+                  echo "Verifying certificate key validity..."
+                  CERT_KEY_VALID=false
+                  if [ -n "$CERT_KEY" ] && [ "$CERT_KEY" != "null" ]; then
+                      # Try to download certs - if it fails, cert key is expired
+                      TEMP_KUBECONFIG=$(mktemp)
+                      ADMIN_CONFIG=$(aws secretsmanager get-secret-value \
+                          --secret-id "vistral-k8s-admin-config" \
+                          --region "$AWS_REGION" \
+                          --query SecretString \
+                          --output text 2>/dev/null || echo "")
+                      if [ -n "$ADMIN_CONFIG" ] && [ "$ADMIN_CONFIG" != "{}" ]; then
+                          echo "$ADMIN_CONFIG" > "$TEMP_KUBECONFIG"
+                          # Check if kubeadm-certs secret exists
+                          if KUBECONFIG="$TEMP_KUBECONFIG" kubectl get secret kubeadm-certs -n kube-system &>/dev/null; then
+                              CERT_KEY_VALID=true
+                              echo "Certificate key is valid"
+                          fi
+                      fi
+                      rm -f "$TEMP_KUBECONFIG"
+                  fi
+
+                  # If certificate key is expired, request refresh from an existing control plane
+                  if [ "$CERT_KEY_VALID" = "false" ]; then
+                      echo "Certificate key expired or invalid, requesting refresh..."
+
+                      # Find an online control plane to refresh certs
+                      MY_INSTANCE_ID=$(curl -s --connect-timeout 2 http://169.254.169.254/latest/meta-data/instance-id 2>/dev/null || echo "")
+                      AVAILABLE_CPS=$(aws ssm describe-instance-information \
+                          --filters "Key=tag:k8s-role,Values=control-plane" \
+                          --query "InstanceInformationList[?PingStatus=='Online'].InstanceId" \
+                          --region "$AWS_REGION" \
+                          --output text 2>/dev/null | tr '\t' '\n' | grep -v "^$MY_INSTANCE_ID$" | head -1)
+
+                      if [ -n "$AVAILABLE_CPS" ]; then
+                          echo "Requesting certificate refresh from $AVAILABLE_CPS..."
+                          REFRESH_CMD_ID=$(aws ssm send-command \
+                              --document-name "AWS-RunShellScript" \
+                              --instance-ids "$AVAILABLE_CPS" \
+                              --parameters 'commands=["export KUBECONFIG=/etc/kubernetes/admin.conf && CERT_KEY=$(kubeadm init phase upload-certs --upload-certs 2>/dev/null | tail -1) && JOIN_CMD=$(kubeadm token create --print-join-command) && EXPIRES_AT=$(date -d \"+24 hours\" -Iseconds) && GENERATED_AT=$(date -Iseconds) && jq -n --arg joinCommand \"$JOIN_CMD\" --arg certKey \"$CERT_KEY\" --arg generatedAt \"$GENERATED_AT\" --arg expiresAt \"$EXPIRES_AT\" --arg generatedBy \"$(hostname)\" \"\\$ARGS.named\" | aws secretsmanager put-secret-value --secret-id vistral-k8s-join-token --secret-string file:///dev/stdin --region us-east-1"]' \
+                              --region "$AWS_REGION" \
+                              --query "Command.CommandId" \
+                              --output text 2>/dev/null) || true
+
+                          if [ -n "$REFRESH_CMD_ID" ]; then
+                              echo "Waiting for certificate refresh (up to 2 minutes)..."
+                              for i in {1..12}; do
+                                  sleep 10
+                                  STATUS=$(aws ssm get-command-invocation \
+                                      --command-id "$REFRESH_CMD_ID" \
+                                      --instance-id "$AVAILABLE_CPS" \
+                                      --region "$AWS_REGION" \
+                                      --query "Status" \
+                                      --output text 2>/dev/null || echo "Pending")
+                                  if [ "$STATUS" = "Success" ]; then
+                                      echo "Certificate refresh complete"
+                                      # Re-fetch the updated token
+                                      JOIN_INFO=$(aws secretsmanager get-secret-value \
+                                          --secret-id "$JOIN_TOKEN_SECRET" \
+                                          --region "$AWS_REGION" \
+                                          --query SecretString \
+                                          --output text 2>/dev/null || echo "")
+                                      JOIN_CMD=$(echo "$JOIN_INFO" | jq -r '.joinCommand')
+                                      CERT_KEY=$(echo "$JOIN_INFO" | jq -r '.certKey')
+                                      break
+                                  elif [ "$STATUS" = "Failed" ]; then
+                                      echo "WARNING: Certificate refresh failed"
+                                      break
+                                  fi
+                                  echo "  Waiting for refresh... ($((i*10))s)"
+                              done
+                          fi
+                      else
+                          echo "WARNING: No available control planes to refresh certificate"
+                      fi
+                  fi
+
+                  if [ -z "$CERT_KEY" ] || [ "$CERT_KEY" = "null" ]; then
+                      echo "ERROR: Invalid certificate key in token"
+                      exit 1
+                  fi
+
+                  # Join as control plane
+                  echo "Joining cluster as control plane..."
+                  sudo $JOIN_CMD --control-plane --certificate-key "$CERT_KEY"
+
+                  # Setup kubectl for this user
+                  mkdir -p $HOME/.kube
+                  sudo cp -f /etc/kubernetes/admin.conf $HOME/.kube/config
+                  sudo chown $(id -u):$(id -g) $HOME/.kube/config
+
+                  # Setup Nginx LB on this node
+                  echo "Setting up Nginx load balancer..."
+                  sudo ./scripts/setup-nginx-lb.sh
+
+                  # Setup Keepalived (backup priority)
+                  echo "Setting up Keepalived (backup mode)..."
+                  sudo ./scripts/setup-keepalived.sh 100
+
+                  echo "Control plane join complete!"
+              fi
+
+          else
+              # Worker node
+              echo "=============================================="
+              echo "JOINING AS WORKER NODE"
+              echo "=============================================="
+
+              if [ "$CLUSTER_EXISTS" = "false" ]; then
+                  echo "ERROR: Cannot join - no cluster found at $VIP_ADDRESS"
+                  echo "The control plane must be initialized first."
+                  exit 1
+              fi
+
+              # Cleanup any stale node entry before joining
+              cleanup_stale_node
+
+              # Get join token
+              JOIN_INFO=$(get_join_token) || exit 1
+
+              JOIN_CMD=$(echo "$JOIN_INFO" | jq -r '.joinCommand')
+
+              if [ -z "$JOIN_CMD" ] || [ "$JOIN_CMD" = "null" ]; then
+                  echo "ERROR: Invalid join command in token"
+                  exit 1
+              fi
+
+              # Run prerequisites
+              run_prerequisites
+
+              # Join as worker
+              echo "Joining cluster as worker node..."
+              sudo $JOIN_CMD
+
+              echo "Worker node join complete!"
+          fi
+
+          # Cleanup
+          echo "Cleaning up..."
+          rm -f ~/.ssh/github_deploy
+
+          echo "=============================================="
+          echo "Auto-join completed successfully at $(date)"
+          echo "=============================================="

@@ -1,0 +1,161 @@
+schemaVersion: "2.2"
+description: |
+  Deploy vistral-platform-v3 Helm chart and bootstrap ArgoCD.
+  Runs on the primary control plane after the cluster is fully formed.
+
+  This document:
+  1. Clones vistral-platform-v3 from GitHub
+  2. Builds Helm dependencies
+  3. Installs the platform chart (or upgrades if already installed)
+  4. Bootstraps ArgoCD
+
+  Guard: Skips if vistral-platform is already deployed and healthy.
+
+parameters:
+  DeployKeySecretName:
+    type: String
+    description: "AWS Secrets Manager secret name containing GitHub deploy key"
+    default: "vistral-github-deploy-key"
+  PlatformRepo:
+    type: String
+    description: "GitHub repository URL for vistral-platform-v3 (SSH format)"
+    default: "git@github.com:VistralAI/vistral-platform-v3.git"
+  AWSRegion:
+    type: String
+    description: "AWS region"
+    default: "us-east-1"
+  Namespace:
+    type: String
+    description: "Kubernetes namespace for the platform"
+    default: "vistral-platform"
+  ValuesOverride:
+    type: String
+    description: "Optional values YAML override (base64 encoded)"
+    default: ""
+
+mainSteps:
+  - action: aws:runShellScript
+    name: deployPlatform
+    inputs:
+      timeoutSeconds: 1800
+      runCommand:
+        - |
+          #!/bin/bash
+          set -e
+
+          export HOME=/root
+
+          DEPLOY_KEY_SECRET="{{DeployKeySecretName}}"
+          PLATFORM_REPO="{{PlatformRepo}}"
+          AWS_REGION="{{AWSRegion}}"
+          NAMESPACE="{{Namespace}}"
+          VALUES_OVERRIDE="{{ValuesOverride}}"
+
+          LOG="/var/log/vistral-platform-deploy.log"
+          exec > >(tee -a "$LOG") 2>&1
+
+          echo "=============================================="
+          echo "Platform Deployment - $(date)"
+          echo "=============================================="
+
+          # Must be primary control plane
+          if [ ! -f /etc/kubernetes/admin.conf ]; then
+              echo "Not a control plane. Skipping platform deploy."
+              exit 0
+          fi
+          export KUBECONFIG=/etc/kubernetes/admin.conf
+
+          HOSTNAME=$(hostname | tr '[:upper:]' '[:lower:]')
+          # Only run on vausk01 to avoid duplicate deploys
+          if [ "$HOSTNAME" != "vausk01" ]; then
+              echo "Platform deploy runs only on vausk01. Current: $HOSTNAME. Skipping."
+              exit 0
+          fi
+
+          # Guard: check if platform is already deployed and healthy
+          if helm status vistral-platform -n "$NAMESPACE" &>/dev/null; then
+              RELEASE_STATUS=$(helm status vistral-platform -n "$NAMESPACE" -o json 2>/dev/null | jq -r '.info.status' 2>/dev/null || echo "unknown")
+              if [ "$RELEASE_STATUS" = "deployed" ]; then
+                  echo "Platform already deployed (status: $RELEASE_STATUS). Skipping."
+                  exit 0
+              else
+                  echo "Platform exists but status: $RELEASE_STATUS. Will attempt upgrade."
+              fi
+          fi
+
+          # Install prerequisites
+          if ! command -v aws &>/dev/null; then
+              cd /tmp
+              curl -sL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+              unzip -q awscliv2.zip
+              ./aws/install --update
+              rm -rf awscliv2.zip aws
+              cd -
+          fi
+
+          if ! command -v helm &>/dev/null; then
+              curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+          fi
+
+          # Get deploy key
+          DEPLOY_KEY=$(aws secretsmanager get-secret-value \
+              --secret-id "$DEPLOY_KEY_SECRET" \
+              --region "$AWS_REGION" \
+              --query SecretString \
+              --output text) || { echo "ERROR: Failed to get deploy key"; exit 1; }
+
+          mkdir -p ~/.ssh
+          echo "$DEPLOY_KEY" > ~/.ssh/github_deploy
+          chmod 600 ~/.ssh/github_deploy
+          ssh-keyscan github.com >> ~/.ssh/known_hosts 2>/dev/null
+          export GIT_SSH_COMMAND="ssh -i ~/.ssh/github_deploy -o StrictHostKeyChecking=no"
+
+          # Clone platform repo
+          echo "Cloning vistral-platform-v3..."
+          rm -rf /opt/vistral-platform-v3
+          git clone "$PLATFORM_REPO" /opt/vistral-platform-v3 || {
+              echo "ERROR: Failed to clone platform repo"
+              rm -f ~/.ssh/github_deploy
+              exit 1
+          }
+          cd /opt/vistral-platform-v3
+
+          # Build Helm dependencies
+          echo "Building Helm dependencies..."
+          helm dependency build 2>/dev/null || helm dependency update
+
+          # Create namespace
+          kubectl create namespace "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
+
+          # Prepare values override
+          VALUES_ARGS="-f values.yaml"
+          if [ -n "$VALUES_OVERRIDE" ]; then
+              echo "$VALUES_OVERRIDE" | base64 -d > /tmp/override-values.yaml
+              VALUES_ARGS="$VALUES_ARGS -f /tmp/override-values.yaml"
+          fi
+
+          # Deploy
+          echo "Deploying vistral-platform..."
+          helm upgrade --install vistral-platform . \
+              --namespace "$NAMESPACE" \
+              $VALUES_ARGS \
+              --wait --timeout 15m
+
+          echo "Platform deployment complete"
+
+          # Bootstrap ArgoCD if install script exists
+          if [ -f argocd/install.sh ]; then
+              echo "Bootstrapping ArgoCD..."
+              cd argocd
+              chmod +x install.sh
+              bash install.sh
+              echo "ArgoCD bootstrap complete"
+          fi
+
+          # Cleanup
+          rm -f ~/.ssh/github_deploy
+          rm -f /tmp/override-values.yaml
+
+          echo "=============================================="
+          echo "Platform deployment complete at $(date)"
+          echo "=============================================="

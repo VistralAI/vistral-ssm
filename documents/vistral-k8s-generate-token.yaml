@@ -1,0 +1,158 @@
+schemaVersion: "2.2"
+description: |
+  Generate kubeadm join token and certificate key, then store in AWS Secrets Manager.
+
+  This document should be run on an existing control plane node.
+  It generates:
+  - A join command with token (valid for 2 hours)
+  - A certificate key for control plane joins (valid for 2 hours)
+
+  The generated credentials are stored in Secrets Manager for other nodes to retrieve.
+
+parameters:
+  JoinTokenSecretName:
+    type: String
+    description: "AWS Secrets Manager secret name to store join token"
+    default: "vistral-k8s-join-token"
+  AWSRegion:
+    type: String
+    description: "AWS region for Secrets Manager"
+    default: "us-east-1"
+  TokenTTL:
+    type: String
+    description: "Token time-to-live (kubeadm format, e.g., 2h)"
+    default: "2h"
+
+mainSteps:
+  - action: aws:runShellScript
+    name: generateJoinToken
+    inputs:
+      timeoutSeconds: 300
+      runCommand:
+        - |
+          #!/bin/bash
+          set -e
+
+          # Configuration from parameters
+          JOIN_TOKEN_SECRET="{{JoinTokenSecretName}}"
+          AWS_REGION="{{AWSRegion}}"
+          TOKEN_TTL="{{TokenTTL}}"
+
+          # Logging
+          LOG="/var/log/k8s-token-generation.log"
+          exec > >(tee -a "$LOG") 2>&1
+
+          echo "=============================================="
+          echo "Kubernetes Token Generation - $(date)"
+          echo "=============================================="
+
+          HOSTNAME=$(hostname)
+          echo "Running on: $HOSTNAME"
+
+          # Check if this is a working control plane
+          echo "Verifying this is a functional control plane..."
+
+          # Check if kubectl works
+          if ! kubectl get nodes &>/dev/null; then
+              echo "ERROR: kubectl cannot connect to the cluster"
+              echo "This node may not be a functional control plane."
+              echo "Skipping token generation."
+              exit 0
+          fi
+
+          # Check if this node is a control plane
+          NODE_ROLE=$(kubectl get node "$HOSTNAME" -o jsonpath='{.metadata.labels.node-role\.kubernetes\.io/control-plane}' 2>/dev/null || echo "")
+          if [ -z "$NODE_ROLE" ]; then
+              echo "WARNING: This node doesn't have control-plane role label."
+              echo "Attempting to continue anyway..."
+          fi
+
+          # Ensure AWS CLI is available (Ubuntu 24.04 doesn't have awscli package)
+          if ! command -v aws &> /dev/null; then
+              echo "Installing AWS CLI v2..."
+              apt-get update
+              apt-get install -y curl unzip
+              cd /tmp
+              curl -sL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+              unzip -q awscliv2.zip
+              ./aws/install --update
+              rm -rf awscliv2.zip aws
+              cd -
+          fi
+
+          echo "Control plane verified. Generating join credentials..."
+
+          # Generate certificate key for control plane joins
+          echo "Uploading certificates and generating certificate key..."
+          CERT_OUTPUT=$(sudo kubeadm init phase upload-certs --upload-certs 2>&1)
+          CERT_KEY=$(echo "$CERT_OUTPUT" | tail -1)
+
+          if [ -z "$CERT_KEY" ] || [ ${#CERT_KEY} -ne 64 ]; then
+              echo "WARNING: Certificate key generation may have failed"
+              echo "Output: $CERT_OUTPUT"
+              # Try to extract from output
+              CERT_KEY=$(echo "$CERT_OUTPUT" | grep -oE '[a-f0-9]{64}' | head -1)
+          fi
+
+          echo "Certificate key generated: ${CERT_KEY:0:8}..."
+
+          # Generate join token and command
+          echo "Creating join token (TTL: $TOKEN_TTL)..."
+          JOIN_CMD=$(kubeadm token create --print-join-command --ttl "$TOKEN_TTL")
+
+          if [ -z "$JOIN_CMD" ]; then
+              echo "ERROR: Failed to generate join command"
+              exit 1
+          fi
+
+          echo "Join command generated successfully"
+
+          # Get timestamps
+          GENERATED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          # Calculate expiry (2 hours from now)
+          EXPIRES_AT=$(date -u -d "+2 hours" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || \
+                       date -u -v+2H +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || \
+                       echo "")
+
+          # Build JSON payload
+          SECRET_JSON=$(cat << EOF
+          {
+            "joinCommand": "$JOIN_CMD",
+            "certKey": "$CERT_KEY",
+            "generatedAt": "$GENERATED_AT",
+            "expiresAt": "$EXPIRES_AT",
+            "generatedBy": "$HOSTNAME"
+          }
+          EOF
+          )
+
+          echo "Storing credentials in Secrets Manager..."
+
+          # Check if secret exists
+          if aws secretsmanager describe-secret \
+              --secret-id "$JOIN_TOKEN_SECRET" \
+              --region "$AWS_REGION" &>/dev/null; then
+              # Update existing secret
+              echo "Updating existing secret..."
+              aws secretsmanager update-secret \
+                  --secret-id "$JOIN_TOKEN_SECRET" \
+                  --secret-string "$SECRET_JSON" \
+                  --region "$AWS_REGION"
+          else
+              # Create new secret
+              echo "Creating new secret..."
+              aws secretsmanager create-secret \
+                  --name "$JOIN_TOKEN_SECRET" \
+                  --description "Kubernetes cluster join credentials (auto-generated)" \
+                  --secret-string "$SECRET_JSON" \
+                  --region "$AWS_REGION" \
+                  --tags Key=Purpose,Value=k8s-cluster-join Key=AutoGenerated,Value=true
+          fi
+
+          echo "=============================================="
+          echo "Token generation complete!"
+          echo "  Generated at: $GENERATED_AT"
+          echo "  Expires at: $EXPIRES_AT"
+          echo "  Generated by: $HOSTNAME"
+          echo "  Secret name: $JOIN_TOKEN_SECRET"
+          echo "=============================================="

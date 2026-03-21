@@ -1,0 +1,140 @@
+schemaVersion: "2.2"
+description: |
+  Install NVIDIA GPU Operator and configure GPU time-slicing on worker nodes.
+
+  This document:
+  1. Verifies GPU hardware is present
+  2. Installs NVIDIA GPU Operator via Helm (if not already installed)
+  3. Configures GPU time-slicing (4 slices per T4)
+  4. Verifies GPU device detection in K8s
+
+  Guard: Skips if no GPU detected or GPU Operator already running.
+  Only runs on control plane nodes (needs kubectl/helm access).
+
+parameters:
+  TimeSliceCount:
+    type: String
+    description: "Number of GPU time slices per physical GPU"
+    default: "4"
+  AWSRegion:
+    type: String
+    description: "AWS region"
+    default: "us-east-1"
+
+mainSteps:
+  - action: aws:runShellScript
+    name: setupGPU
+    inputs:
+      timeoutSeconds: 900
+      runCommand:
+        - |
+          #!/bin/bash
+          set -e
+
+          TIME_SLICE_COUNT="{{TimeSliceCount}}"
+
+          LOG="/var/log/vistral-gpu-setup.log"
+          exec > >(tee -a "$LOG") 2>&1
+
+          echo "=============================================="
+          echo "GPU Operator Setup - $(date)"
+          echo "=============================================="
+
+          HOSTNAME=$(hostname | tr '[:upper:]' '[:lower:]')
+
+          # Only run on control plane (needs kubectl/helm)
+          if [ ! -f /etc/kubernetes/admin.conf ]; then
+              echo "Not a control plane node. Skipping GPU setup."
+              exit 0
+          fi
+          export KUBECONFIG=/etc/kubernetes/admin.conf
+
+          # Guard: check if GPU Operator is already deployed
+          if kubectl get pods -n gpu-operator -l app=gpu-operator 2>/dev/null | grep -q Running; then
+              echo "GPU Operator already running. Skipping installation."
+
+              # Still check time-slicing config
+              if kubectl get configmap -n gpu-operator gpu-sharing-config &>/dev/null; then
+                  echo "Time-slicing config already exists."
+                  exit 0
+              fi
+          else
+              # Check if any GPU worker nodes exist
+              GPU_NODES=$(kubectl get nodes -l vistral.ai/gpu=true -o name 2>/dev/null | wc -l)
+              if [ "$GPU_NODES" -eq 0 ]; then
+                  # Fallback: check if any vausw nodes exist
+                  GPU_NODES=$(kubectl get nodes -o name 2>/dev/null | grep -c "vausw" || echo "0")
+              fi
+
+              if [ "$GPU_NODES" -eq 0 ]; then
+                  echo "No GPU worker nodes in cluster. Skipping GPU Operator."
+                  exit 0
+              fi
+
+              echo "Found $GPU_NODES GPU worker node(s). Installing GPU Operator..."
+
+              # Ensure Helm is installed
+              if ! command -v helm &>/dev/null; then
+                  echo "Installing Helm..."
+                  curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+              fi
+
+              # Add NVIDIA Helm repo
+              helm repo add nvidia https://helm.ngc.nvidia.com/nvidia 2>/dev/null || true
+              helm repo update
+
+              # Install GPU Operator
+              helm install gpu-operator nvidia/gpu-operator \
+                  --namespace gpu-operator \
+                  --create-namespace \
+                  --set driver.enabled=true \
+                  --set toolkit.enabled=true \
+                  --set devicePlugin.enabled=true \
+                  --set gfd.enabled=true \
+                  --set migManager.enabled=false \
+                  --set dcgmExporter.enabled=true \
+                  --wait --timeout 10m
+
+              echo "GPU Operator installed"
+          fi
+
+          # Configure GPU time-slicing
+          echo "Configuring GPU time-slicing ($TIME_SLICE_COUNT slices per GPU)..."
+          kubectl apply -f - <<TIMESLICE
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: gpu-sharing-config
+            namespace: gpu-operator
+          data:
+            any: |-
+              version: v1
+              flags:
+                migStrategy: none
+              sharing:
+                timeSlicing:
+                  renameByDefault: false
+                  failRequestsGreaterThanOne: false
+                  resources:
+                    - name: nvidia.com/gpu
+                      replicas: $TIME_SLICE_COUNT
+          TIMESLICE
+
+          # Patch GPU Operator ClusterPolicy to use time-slicing config
+          kubectl patch clusterpolicy/cluster-policy \
+              -n gpu-operator \
+              --type merge \
+              -p '{"spec":{"devicePlugin":{"config":{"name":"gpu-sharing-config","default":"any"}}}}' \
+              2>/dev/null || echo "ClusterPolicy patch skipped (may need manual config)"
+
+          echo "Waiting for GPU device plugin to restart..."
+          kubectl rollout restart daemonset -n gpu-operator nvidia-device-plugin-daemonset 2>/dev/null || true
+          sleep 30
+
+          # Verify GPU resources
+          echo "Verifying GPU resources..."
+          kubectl get nodes -o custom-columns="NAME:.metadata.name,GPU:.status.allocatable.nvidia\.com/gpu" 2>/dev/null || true
+
+          echo "=============================================="
+          echo "GPU setup complete at $(date)"
+          echo "=============================================="

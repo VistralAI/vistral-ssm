@@ -1,0 +1,146 @@
+schemaVersion: "2.2"
+description: |
+  Run helm/kubectl update operations on the primary control plane.
+  Triggered manually (on-demand) when cluster configuration needs updating.
+
+  This document:
+  1. Verifies it is running on a healthy control plane
+  2. Clones latest vistral-cluster from GitHub
+  3. Executes the requested update operation
+
+parameters:
+  DeployKeySecretName:
+    type: String
+    description: "AWS Secrets Manager secret name containing GitHub deploy key"
+    default: "vistral-github-deploy-key"
+  GitHubRepo:
+    type: String
+    description: "GitHub repository URL (SSH format)"
+    default: "git@github.com:VistralAI/vistral-cluster.git"
+  AWSRegion:
+    type: String
+    description: "AWS region for Secrets Manager"
+    default: "us-east-1"
+  Operation:
+    type: String
+    description: "Update operation to perform"
+    default: "status"
+    allowedValues:
+      - "status"
+      - "upgrade-cluster"
+      - "upgrade-addons"
+      - "rotate-certs"
+      - "refresh-secrets"
+
+mainSteps:
+  - action: aws:runShellScript
+    name: clusterUpdate
+    inputs:
+      timeoutSeconds: 1800
+      runCommand:
+        - |
+          #!/bin/bash
+          set -e
+
+          export HOME=/root
+
+          DEPLOY_KEY_SECRET="{{DeployKeySecretName}}"
+          GITHUB_REPO="{{GitHubRepo}}"
+          AWS_REGION="{{AWSRegion}}"
+          OPERATION="{{Operation}}"
+
+          LOG="/var/log/vistral-cluster-update.log"
+          exec > >(tee -a "$LOG") 2>&1
+
+          echo "=============================================="
+          echo "Cluster Update: $OPERATION - $(date)"
+          echo "=============================================="
+
+          # Verify this is a control plane with kubectl access
+          export KUBECONFIG=/etc/kubernetes/admin.conf
+          if ! kubectl cluster-info &>/dev/null; then
+              echo "ERROR: Not a healthy control plane or kubectl not configured"
+              exit 1
+          fi
+
+          # Install AWS CLI if needed
+          if ! command -v aws &>/dev/null; then
+              cd /tmp
+              curl -sL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+              unzip -q awscliv2.zip
+              ./aws/install --update
+              rm -rf awscliv2.zip aws
+              cd -
+          fi
+
+          # Clone latest vistral-cluster
+          DEPLOY_KEY=$(aws secretsmanager get-secret-value \
+              --secret-id "$DEPLOY_KEY_SECRET" \
+              --region "$AWS_REGION" \
+              --query SecretString \
+              --output text) || { echo "ERROR: Failed to get deploy key"; exit 1; }
+
+          mkdir -p ~/.ssh
+          echo "$DEPLOY_KEY" > ~/.ssh/github_deploy
+          chmod 600 ~/.ssh/github_deploy
+          ssh-keyscan github.com >> ~/.ssh/known_hosts 2>/dev/null
+          export GIT_SSH_COMMAND="ssh -i ~/.ssh/github_deploy -o StrictHostKeyChecking=no"
+
+          rm -rf /opt/vistral-cluster
+          git clone "$GITHUB_REPO" /opt/vistral-cluster
+          cd /opt/vistral-cluster
+          chmod +x *.sh scripts/*.sh
+          source ./config.sh
+
+          case "$OPERATION" in
+              "status")
+                  echo "=== Cluster Status ==="
+                  kubectl get nodes -o wide
+                  echo
+                  echo "=== Pod Status ==="
+                  kubectl get pods -A --field-selector=status.phase!=Running,status.phase!=Succeeded 2>/dev/null || echo "All pods healthy"
+                  echo
+                  echo "=== Component Status ==="
+                  kubectl get cs 2>/dev/null || kubectl get --raw='/readyz?verbose' 2>/dev/null || true
+                  ;;
+
+              "upgrade-cluster")
+                  echo "Upgrading Kubernetes components..."
+                  if [ -f scripts/kubernetes.sh ]; then
+                      sudo ./scripts/kubernetes.sh
+                  fi
+                  echo "Upgrade complete. Run on each node to upgrade kubelet."
+                  ;;
+
+              "upgrade-addons")
+                  echo "Upgrading cluster addons..."
+                  [ -f scripts/ingress-controller.sh ] && sudo ./scripts/ingress-controller.sh
+                  [ -f scripts/cert-manager.sh ] && sudo ./scripts/cert-manager.sh
+                  [ -f scripts/install-nfs-csi.sh ] && sudo ./scripts/install-nfs-csi.sh
+                  [ -f scripts/dashboard.sh ] && sudo ./scripts/dashboard.sh
+                  echo "Addon upgrades complete."
+                  ;;
+
+              "rotate-certs")
+                  echo "Rotating cluster certificates..."
+                  kubeadm certs renew all
+                  # Restart control plane components
+                  crictl pods --name 'kube-apiserver|kube-controller-manager|kube-scheduler|etcd' -q | xargs -r crictl stopp
+                  echo "Certificate rotation complete."
+                  ;;
+
+              "refresh-secrets")
+                  echo "Refreshing K8s secrets from AWS Secrets Manager..."
+                  if [ -f scripts/bootstrap-secrets.sh ]; then
+                      sudo ./scripts/bootstrap-secrets.sh
+                  fi
+                  echo "Secrets refreshed."
+                  ;;
+          esac
+
+          # Cleanup
+          rm -f ~/.ssh/github_deploy
+
+          echo "=============================================="
+          echo "Update '$OPERATION' completed at $(date)"
+          echo "=============================================="

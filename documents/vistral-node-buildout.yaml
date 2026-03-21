@@ -1,0 +1,187 @@
+schemaVersion: "0.3"
+description: |
+  Zero-touch node buildout orchestrator.
+  Runs all SSM documents in order after a device registers with SSM.
+
+  Execution order:
+  1. T2 Bootstrap — detect Apple hardware, install T2 kernel (continues on failure for non-Apple)
+  2. Wait for potential reboot
+  3. K8s Join — join cluster based on hostname role (aborts on failure, retries once)
+     Also auto-resets stale/broken nodes (expired certs, dead kubelet) before rejoining
+  4. Node Label — apply labels and taints based on hardware/role (continues on failure)
+  5. GPU Setup — install GPU Operator, configure time-slicing (continues on failure, not all nodes have GPUs)
+  6. DNS Setup — install CoreDNS on CPs, configure worker DNS (continues on failure)
+  7. Platform Deploy — deploy Helm chart + ArgoCD, only on vausk01 (continues on failure)
+  8. Health Check — validate all components, report status (always continues)
+
+  Each step waits for the previous one to complete.
+  Guards in each document make the entire runbook idempotent — safe to run repeatedly.
+
+assumeRole: "{{AutomationAssumeRole}}"
+
+parameters:
+  InstanceId:
+    type: String
+    description: "Target instance ID (hybrid managed instance)"
+  DeployKeySecretName:
+    type: String
+    description: "AWS Secrets Manager secret name containing GitHub deploy key"
+    default: "vistral-github-deploy-key"
+  JoinTokenSecretName:
+    type: String
+    description: "AWS Secrets Manager secret name for join tokens"
+    default: "vistral-k8s-join-token"
+  VipAddress:
+    type: String
+    description: "Virtual IP address for the Kubernetes API"
+    default: "192.168.1.204"
+  GitHubRepo:
+    type: String
+    description: "GitHub repository URL (SSH format)"
+    default: "git@github.com:VistralAI/vistral-cluster.git"
+  PlatformRepo:
+    type: String
+    description: "GitHub repository URL for vistral-platform-v3 (SSH format)"
+    default: "git@github.com:VistralAI/vistral-platform-v3.git"
+  AWSRegion:
+    type: String
+    description: "AWS region"
+    default: "us-east-1"
+  AutomationAssumeRole:
+    type: String
+    description: "IAM role ARN for Automation to assume"
+    default: ""
+
+mainSteps:
+  # Step 1: T2 hardware bootstrap
+  - name: t2Bootstrap
+    action: aws:runCommand
+    onFailure: Continue
+    timeoutSeconds: 900
+    inputs:
+      DocumentName: vistral-t2-bootstrap
+      InstanceIds:
+        - "{{InstanceId}}"
+      Parameters:
+        LogPath:
+          - "/var/log/vistral-t2-bootstrap.log"
+      CloudWatchOutputConfig:
+        CloudWatchLogGroupName: /aws/ssm/vistral-buildout
+        CloudWatchOutputEnabled: true
+
+  # Step 2: Wait for potential T2 reboot
+  - name: waitForReboot
+    action: aws:sleep
+    inputs:
+      Duration: PT90S
+
+  # Step 3: Join Kubernetes cluster (or auto-reset + rejoin if stale)
+  - name: k8sJoin
+    action: aws:runCommand
+    onFailure: Abort
+    maxAttempts: 2
+    timeoutSeconds: 2400
+    inputs:
+      DocumentName: vistral-k8s-join
+      InstanceIds:
+        - "{{InstanceId}}"
+      Parameters:
+        DeployKeySecretName:
+          - "{{DeployKeySecretName}}"
+        JoinTokenSecretName:
+          - "{{JoinTokenSecretName}}"
+        VipAddress:
+          - "{{VipAddress}}"
+        GitHubRepo:
+          - "{{GitHubRepo}}"
+        AWSRegion:
+          - "{{AWSRegion}}"
+      CloudWatchOutputConfig:
+        CloudWatchLogGroupName: /aws/ssm/vistral-buildout
+        CloudWatchOutputEnabled: true
+
+  # Step 4: Label and taint the node
+  - name: nodeLabel
+    action: aws:runCommand
+    onFailure: Continue
+    timeoutSeconds: 300
+    inputs:
+      DocumentName: vistral-node-label
+      InstanceIds:
+        - "{{InstanceId}}"
+      Parameters:
+        AWSRegion:
+          - "{{AWSRegion}}"
+      CloudWatchOutputConfig:
+        CloudWatchLogGroupName: /aws/ssm/vistral-buildout
+        CloudWatchOutputEnabled: true
+
+  # Step 5: GPU Operator setup (skips if no GPU)
+  - name: gpuSetup
+    action: aws:runCommand
+    onFailure: Continue
+    timeoutSeconds: 900
+    inputs:
+      DocumentName: vistral-gpu-setup
+      InstanceIds:
+        - "{{InstanceId}}"
+      Parameters:
+        AWSRegion:
+          - "{{AWSRegion}}"
+      CloudWatchOutputConfig:
+        CloudWatchLogGroupName: /aws/ssm/vistral-buildout
+        CloudWatchOutputEnabled: true
+
+  # Step 6: DNS setup
+  - name: dnsSetup
+    action: aws:runCommand
+    onFailure: Continue
+    timeoutSeconds: 900
+    inputs:
+      DocumentName: vistral-dns-setup
+      InstanceIds:
+        - "{{InstanceId}}"
+      Parameters:
+        VipAddress:
+          - "{{VipAddress}}"
+        AWSRegion:
+          - "{{AWSRegion}}"
+      CloudWatchOutputConfig:
+        CloudWatchLogGroupName: /aws/ssm/vistral-buildout
+        CloudWatchOutputEnabled: true
+
+  # Step 7: Platform deployment (only runs on vausk01, skips elsewhere)
+  - name: platformDeploy
+    action: aws:runCommand
+    onFailure: Continue
+    timeoutSeconds: 1800
+    inputs:
+      DocumentName: vistral-platform-deploy
+      InstanceIds:
+        - "{{InstanceId}}"
+      Parameters:
+        DeployKeySecretName:
+          - "{{DeployKeySecretName}}"
+        PlatformRepo:
+          - "{{PlatformRepo}}"
+        AWSRegion:
+          - "{{AWSRegion}}"
+      CloudWatchOutputConfig:
+        CloudWatchLogGroupName: /aws/ssm/vistral-buildout
+        CloudWatchOutputEnabled: true
+
+  # Step 8: Health check (always runs, always succeeds — reporting only)
+  - name: healthCheck
+    action: aws:runCommand
+    onFailure: Continue
+    timeoutSeconds: 300
+    inputs:
+      DocumentName: vistral-health-check
+      InstanceIds:
+        - "{{InstanceId}}"
+      Parameters:
+        AWSRegion:
+          - "{{AWSRegion}}"
+      CloudWatchOutputConfig:
+        CloudWatchLogGroupName: /aws/ssm/vistral-buildout
+        CloudWatchOutputEnabled: true

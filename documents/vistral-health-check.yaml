@@ -1,0 +1,195 @@
+schemaVersion: "2.2"
+description: |
+  Comprehensive cluster health check. Validates all infrastructure components
+  and reports status. Does not modify anything — read-only.
+
+  Checks:
+  - API server reachability
+  - etcd health (control planes)
+  - Kubelet status on this node
+  - Node Ready status
+  - CoreDNS resolution
+  - NFS mount accessibility
+  - GPU availability (if GPU node)
+  - Cert-manager health
+  - Ingress controller health
+  - Platform pods health
+
+  Returns exit 0 with report. Individual check failures are logged but
+  don't fail the document — this is a reporting tool.
+
+parameters:
+  AWSRegion:
+    type: String
+    description: "AWS region"
+    default: "us-east-1"
+
+mainSteps:
+  - action: aws:runShellScript
+    name: healthCheck
+    inputs:
+      timeoutSeconds: 300
+      runCommand:
+        - |
+          #!/bin/bash
+
+          LOG="/var/log/vistral-health-check.log"
+          exec > >(tee -a "$LOG") 2>&1
+
+          echo "=============================================="
+          echo "Cluster Health Check - $(date)"
+          echo "=============================================="
+
+          HOSTNAME=$(hostname | tr '[:upper:]' '[:lower:]')
+          PASS=0
+          FAIL=0
+          WARN=0
+
+          check() {
+              local name="$1"
+              shift
+              if "$@" &>/dev/null; then
+                  echo "  [PASS] $name"
+                  ((PASS++))
+              else
+                  echo "  [FAIL] $name"
+                  ((FAIL++))
+              fi
+          }
+
+          warn_check() {
+              local name="$1"
+              shift
+              if "$@" &>/dev/null; then
+                  echo "  [PASS] $name"
+                  ((PASS++))
+              else
+                  echo "  [WARN] $name"
+                  ((WARN++))
+              fi
+          }
+
+          # ---- Node-level checks (run on any node) ----
+          echo
+          echo "=== Node: $HOSTNAME ==="
+
+          check "Kubelet running" systemctl is-active --quiet kubelet
+          check "Containerd running" systemctl is-active --quiet containerd
+          check "SSM agent running" systemctl is-active --quiet amazon-ssm-agent
+
+          # DNS resolution
+          check "External DNS (google.com)" nslookup google.com
+          warn_check "Vistral DNS (cvat.vistral)" nslookup cvat.vistral
+
+          # NFS accessibility
+          NAS_IP="192.168.1.201"
+          check "NFS server reachable ($NAS_IP)" ping -c 1 -W 2 "$NAS_IP"
+          warn_check "NFS port open" bash -c "echo > /dev/tcp/$NAS_IP/2049" 2>/dev/null
+
+          # Disk space
+          ROOT_USE=$(df / | tail -1 | awk '{print $5}' | tr -d '%')
+          if [ "$ROOT_USE" -lt 90 ]; then
+              echo "  [PASS] Disk usage: ${ROOT_USE}%"
+              ((PASS++))
+          else
+              echo "  [FAIL] Disk usage: ${ROOT_USE}% (>90%)"
+              ((FAIL++))
+          fi
+
+          # CoreDNS (control plane only)
+          if systemctl is-active --quiet coredns@primary.service 2>/dev/null; then
+              check "CoreDNS running" systemctl is-active --quiet coredns@primary.service
+              check "CoreDNS health endpoint" curl -sf http://localhost:8080/health
+          fi
+
+          # GPU (if present)
+          if command -v nvidia-smi &>/dev/null; then
+              check "NVIDIA driver loaded" nvidia-smi
+              GPU_INFO=$(nvidia-smi --query-gpu=name,memory.total,temperature.gpu --format=csv,noheader 2>/dev/null || echo "unknown")
+              echo "  [INFO] GPU: $GPU_INFO"
+          fi
+
+          # ---- Cluster-level checks (control plane only) ----
+          if [ -f /etc/kubernetes/admin.conf ]; then
+              export KUBECONFIG=/etc/kubernetes/admin.conf
+
+              echo
+              echo "=== Cluster ==="
+
+              check "API server healthy" kubectl get --raw='/healthz'
+              check "etcd healthy" kubectl get --raw='/healthz/etcd'
+
+              # Node status
+              TOTAL_NODES=$(kubectl get nodes --no-headers 2>/dev/null | wc -l)
+              READY_NODES=$(kubectl get nodes --no-headers 2>/dev/null | grep -c " Ready")
+              NOTREADY_NODES=$((TOTAL_NODES - READY_NODES))
+              if [ "$NOTREADY_NODES" -eq 0 ]; then
+                  echo "  [PASS] All nodes Ready ($READY_NODES/$TOTAL_NODES)"
+                  ((PASS++))
+              else
+                  echo "  [FAIL] NotReady nodes: $NOTREADY_NODES (of $TOTAL_NODES)"
+                  kubectl get nodes --no-headers 2>/dev/null | grep -v " Ready" || true
+                  ((FAIL++))
+              fi
+
+              # System pods
+              FAILED_PODS=$(kubectl get pods -A --field-selector=status.phase!=Running,status.phase!=Succeeded --no-headers 2>/dev/null | wc -l)
+              if [ "$FAILED_PODS" -eq 0 ]; then
+                  echo "  [PASS] All system pods healthy"
+                  ((PASS++))
+              else
+                  echo "  [WARN] Unhealthy pods: $FAILED_PODS"
+                  kubectl get pods -A --field-selector=status.phase!=Running,status.phase!=Succeeded --no-headers 2>/dev/null | head -10
+                  ((WARN++))
+              fi
+
+              # Component checks
+              warn_check "Ingress controller" kubectl get pods -n ingress-nginx -l app.kubernetes.io/component=controller --no-headers 2>/dev/null
+              warn_check "Cert-manager" kubectl get pods -n cert-manager -l app=cert-manager --no-headers 2>/dev/null
+              warn_check "GPU Operator" kubectl get pods -n gpu-operator -l app=gpu-operator --no-headers 2>/dev/null
+
+              # Platform check
+              warn_check "Platform namespace" kubectl get namespace vistral-platform
+
+              # Certificate expiry
+              if kubectl get clusterissuer letsencrypt-prod &>/dev/null 2>&1; then
+                  CERT_READY=$(kubectl get clusterissuer letsencrypt-prod -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || echo "Unknown")
+                  if [ "$CERT_READY" = "True" ]; then
+                      echo "  [PASS] Let's Encrypt issuer ready"
+                      ((PASS++))
+                  else
+                      echo "  [WARN] Let's Encrypt issuer: $CERT_READY"
+                      ((WARN++))
+                  fi
+              fi
+
+              # K8s control plane certs
+              if [ -f /etc/kubernetes/pki/apiserver.crt ]; then
+                  CERT_DAYS=$(openssl x509 -in /etc/kubernetes/pki/apiserver.crt -noout -enddate 2>/dev/null | cut -d= -f2)
+                  CERT_EPOCH=$(date -d "$CERT_DAYS" +%s 2>/dev/null || echo "0")
+                  NOW_EPOCH=$(date +%s)
+                  DAYS_LEFT=$(( (CERT_EPOCH - NOW_EPOCH) / 86400 ))
+                  if [ "$DAYS_LEFT" -gt 30 ]; then
+                      echo "  [PASS] API server cert expires in ${DAYS_LEFT}d"
+                      ((PASS++))
+                  elif [ "$DAYS_LEFT" -gt 0 ]; then
+                      echo "  [WARN] API server cert expires in ${DAYS_LEFT}d"
+                      ((WARN++))
+                  else
+                      echo "  [FAIL] API server cert EXPIRED"
+                      ((FAIL++))
+                  fi
+              fi
+          fi
+
+          # Summary
+          echo
+          echo "=============================================="
+          echo "Health Check Summary"
+          echo "  PASS: $PASS"
+          echo "  WARN: $WARN"
+          echo "  FAIL: $FAIL"
+          echo "=============================================="
+
+          # Always exit 0 — this is a reporting tool
+          exit 0
