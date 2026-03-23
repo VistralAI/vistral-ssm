@@ -63,7 +63,8 @@ mainSteps:
               GPU_NODES=$(kubectl get nodes -l vistral.ai/gpu=true -o name 2>/dev/null | wc -l)
               if [ "$GPU_NODES" -eq 0 ]; then
                   # Fallback: check if any vausw nodes exist
-                  GPU_NODES=$(kubectl get nodes -o name 2>/dev/null | grep -c "vausw" || echo "0")
+                  GPU_NODES=$(kubectl get nodes -o name 2>/dev/null | grep -c "vausw" || true)
+                  GPU_NODES=${GPU_NODES:-0}
               fi
 
               if [ "$GPU_NODES" -eq 0 ]; then
