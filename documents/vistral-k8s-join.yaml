@@ -416,11 +416,16 @@ mainSteps:
 
                   echo "Cluster initialization complete!"
 
-                  # Store join token in Secrets Manager for other nodes to use
-                  echo "Generating and storing join token in Secrets Manager..."
-
                   # Setup kubectl for root
                   export KUBECONFIG=/etc/kubernetes/admin.conf
+
+                  # Remove control-plane NoSchedule taint — bare-metal CPs run workloads
+                  echo "Removing control-plane NoSchedule taint..."
+                  kubectl taint nodes "$(hostname | tr '[:upper:]' '[:lower:]')" \
+                      node-role.kubernetes.io/control-plane:NoSchedule- 2>/dev/null || true
+
+                  # Store join token in Secrets Manager for other nodes to use
+                  echo "Generating and storing join token in Secrets Manager..."
 
                   # Generate certificate key for control plane joining
                   CERT_KEY=$(sudo kubeadm init phase upload-certs --upload-certs 2>/dev/null | tail -1)
@@ -590,6 +595,12 @@ mainSteps:
                   mkdir -p $HOME/.kube
                   sudo cp -f /etc/kubernetes/admin.conf $HOME/.kube/config
                   sudo chown $(id -u):$(id -g) $HOME/.kube/config
+                  export KUBECONFIG=/etc/kubernetes/admin.conf
+
+                  # Remove control-plane NoSchedule taint — bare-metal CPs run workloads
+                  echo "Removing control-plane NoSchedule taint..."
+                  kubectl taint nodes "$(hostname | tr '[:upper:]' '[:lower:]')" \
+                      node-role.kubernetes.io/control-plane:NoSchedule- 2>/dev/null || true
 
                   # Setup Nginx LB on this node
                   echo "Setting up Nginx load balancer..."

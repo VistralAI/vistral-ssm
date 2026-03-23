@@ -78,6 +78,11 @@ mainSteps:
               if [ "$RELEASE_STATUS" = "deployed" ]; then
                   echo "Platform already deployed (status: $RELEASE_STATUS). Skipping."
                   exit 0
+              elif [ "$RELEASE_STATUS" = "failed" ] || [ "$RELEASE_STATUS" = "pending-install" ] || [ "$RELEASE_STATUS" = "uninstalling" ]; then
+                  echo "Platform in broken state: $RELEASE_STATUS. Cleaning up before retry..."
+                  helm uninstall vistral-platform -n "$NAMESPACE" --no-hooks --wait --timeout 2m 2>/dev/null || true
+                  # Delete any webhook that blocks ingress creation
+                  kubectl delete validatingwebhookconfiguration ingress-nginx-admission 2>/dev/null || true
               else
                   echo "Platform exists but status: $RELEASE_STATUS. Will attempt upgrade."
               fi
