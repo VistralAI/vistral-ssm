@@ -15,7 +15,7 @@ parameters:
   DeployKeySecretName:
     type: String
     description: "AWS Secrets Manager secret name containing GitHub deploy key"
-    default: "vistral-github-deploy-key"
+    default: "vistral-github-deploy-key-platform"
   PlatformRepo:
     type: String
     description: "GitHub repository URL for vistral-platform-v3 (SSH format)"
