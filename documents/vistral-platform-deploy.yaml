@@ -134,9 +134,32 @@ mainSteps:
               VALUES_ARGS="$VALUES_ARGS -f /tmp/override-values.yaml"
           fi
 
-          # Deploy
-          echo "Deploying vistral-platform..."
+          # Phase 1: Install operators and infrastructure (skip CRD-dependent custom resources)
+          echo "Phase 1: Installing operators (CRDs)..."
           helm upgrade --install vistral-platform . \
+              --namespace "$NAMESPACE" \
+              $VALUES_ARGS \
+              --set global.skipCustomResources=true \
+              --timeout 10m
+
+          # Wait for operator CRDs to be registered
+          echo "Waiting for CRDs..."
+          for crd in externalsecrets.external-secrets.io scaledjobs.keda.sh; do
+              for i in $(seq 1 60); do
+                  if kubectl get crd "$crd" &>/dev/null; then
+                      echo "  CRD $crd ready"
+                      break
+                  fi
+                  if [ "$i" -eq 60 ]; then
+                      echo "  WARNING: CRD $crd not found after 5 minutes, continuing anyway"
+                  fi
+                  sleep 5
+              done
+          done
+
+          # Phase 2: Full deploy with custom resources enabled
+          echo "Phase 2: Full platform deployment..."
+          helm upgrade vistral-platform . \
               --namespace "$NAMESPACE" \
               $VALUES_ARGS \
               --wait --timeout 15m
