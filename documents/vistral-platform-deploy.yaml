@@ -141,11 +141,17 @@ mainSteps:
 
           # Phase 1: Install operators and infrastructure (skip CRD-dependent custom resources)
           echo "Phase 1: Installing operators (CRDs)..."
-          helm upgrade --install vistral-platform . \
+          if ! helm upgrade --install vistral-platform . \
               --namespace "$NAMESPACE" \
+              --create-namespace \
               $VALUES_ARGS \
               --set global.skipCustomResources=true \
-              --timeout 10m
+              --timeout 10m; then
+              echo "Phase 1 failed. Cleaning up broken release..."
+              helm uninstall vistral-platform -n "$NAMESPACE" --no-hooks 2>/dev/null || true
+              kubectl delete validatingwebhookconfiguration ingress-nginx-admission 2>/dev/null || true
+              exit 1
+          fi
 
           # Wait for operator CRDs to be registered
           echo "Waiting for CRDs..."
