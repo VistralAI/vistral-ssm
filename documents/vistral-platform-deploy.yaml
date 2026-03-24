@@ -132,6 +132,32 @@ mainSteps:
           # Create namespace
           kubectl create namespace "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
 
+          # Bootstrap secrets (idempotent — only creates if missing)
+          echo "Bootstrapping secrets..."
+          for ns in "$NAMESPACE" cvat automation video-processing; do
+              kubectl create namespace "$ns" --dry-run=client -o yaml | kubectl apply -f - 2>/dev/null || true
+          done
+
+          create_secret() {
+              local ns="$1" name="$2"; shift 2
+              if ! kubectl get secret "$name" -n "$ns" &>/dev/null; then
+                  echo "  Creating secret $ns/$name"
+                  kubectl create secret generic "$name" -n "$ns" "$@"
+              fi
+          }
+
+          create_secret "$NAMESPACE" redis-credentials \
+              --from-literal=password=changeme \
+              --from-literal=redis-password=changeme
+
+          create_secret "$NAMESPACE" postgresql-credentials \
+              --from-literal=postgresql-password=changeme \
+              --from-literal=postgres-password=changeme \
+              --from-literal=password=changeme
+
+          create_secret "$NAMESPACE" cvat-analytics-secret \
+              --from-literal=secret-key=changeme-analytics-key
+
           # Prepare values override
           VALUES_ARGS="-f values.yaml"
           if [ -n "$VALUES_OVERRIDE" ]; then
