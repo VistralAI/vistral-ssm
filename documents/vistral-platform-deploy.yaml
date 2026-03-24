@@ -173,7 +173,8 @@ mainSteps:
               --from-literal=password=changeme
 
           create_secret "$NAMESPACE" cvat-analytics-secret \
-              --from-literal=secret-key=changeme-analytics-key
+              --from-literal=secret-key=changeme-analytics-key \
+              --from-literal=CLICKHOUSE_PASSWORD=changeme
 
           # Prepare values override
           VALUES_ARGS="-f values.yaml"
