@@ -115,6 +115,20 @@ mainSteps:
           ssh-keyscan github.com >> ~/.ssh/known_hosts 2>/dev/null
           export GIT_SSH_COMMAND="ssh -i ~/.ssh/github_deploy -o StrictHostKeyChecking=no"
 
+          # Host prerequisites — Longhorn needs iSCSI
+          echo "Checking host prerequisites..."
+          if ! command -v iscsiadm &>/dev/null; then
+              echo "  Installing open-iscsi for Longhorn..."
+              apt-get update -qq && apt-get install -y -qq open-iscsi 2>&1 || echo "  WARNING: failed to install open-iscsi"
+          fi
+          if ! systemctl is-active --quiet iscsid 2>/dev/null; then
+              systemctl enable --now iscsid || echo "  WARNING: failed to enable iscsid"
+          fi
+          if ! lsmod | grep -q iscsi_tcp 2>/dev/null; then
+              modprobe iscsi_tcp || echo "  WARNING: failed to load iscsi_tcp"
+              echo "iscsi_tcp" > /etc/modules-load.d/iscsi.conf 2>/dev/null || true
+          fi
+
           # Clone platform repo
           echo "Cloning vistral-platform-v3..."
           rm -rf /opt/vistral-platform-v3
@@ -125,9 +139,13 @@ mainSteps:
           }
           cd /opt/vistral-platform-v3
 
-          # Build Helm dependencies
-          echo "Building Helm dependencies..."
-          helm dependency build 2>/dev/null || helm dependency update
+          # Build Helm dependencies (skip if already vendored in charts/)
+          if [ -d charts ] && ls charts/*.tgz &>/dev/null; then
+              echo "Chart dependencies already vendored, skipping build"
+          else
+              echo "Building Helm dependencies..."
+              helm dependency build 2>/dev/null || helm dependency update
+          fi
 
           # Create namespace
           kubectl create namespace "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
@@ -193,7 +211,14 @@ mainSteps:
               --timeout 10m; then
               echo "Phase 1 failed. Cleaning up broken release..."
               helm uninstall vistral-platform -n "$NAMESPACE" --no-hooks 2>/dev/null || true
-              kubectl delete validatingwebhookconfiguration ingress-nginx-admission 2>/dev/null || true
+              kubectl delete validatingwebhookconfiguration ingress-nginx-admission --ignore-not-found 2>/dev/null || true
+              # Wait for Helm-created namespaces to fully terminate so next retry is clean
+              for ns in cvat automation video-processing; do
+                  if kubectl get namespace "$ns" &>/dev/null; then
+                      echo "  Waiting for namespace $ns to terminate..."
+                      kubectl wait --for=delete namespace/"$ns" --timeout=120s 2>/dev/null || true
+                  fi
+              done
               exit 1
           fi
 
@@ -214,10 +239,21 @@ mainSteps:
 
           # Phase 2: Full deploy with custom resources enabled
           echo "Phase 2: Full platform deployment..."
-          helm upgrade vistral-platform . \
+          if ! helm upgrade vistral-platform . \
               --namespace "$NAMESPACE" \
               $VALUES_ARGS \
-              --wait --timeout 15m
+              --wait --timeout 15m; then
+              echo "Phase 2 failed. Cleaning up broken release..."
+              helm uninstall vistral-platform -n "$NAMESPACE" --no-hooks 2>/dev/null || true
+              kubectl delete validatingwebhookconfiguration ingress-nginx-admission --ignore-not-found 2>/dev/null || true
+              for ns in cvat automation video-processing; do
+                  if kubectl get namespace "$ns" &>/dev/null; then
+                      echo "  Waiting for namespace $ns to terminate..."
+                      kubectl wait --for=delete namespace/"$ns" --timeout=120s 2>/dev/null || true
+                  fi
+              done
+              exit 1
+          fi
 
           echo "Platform deployment complete"
 
