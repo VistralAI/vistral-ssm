@@ -104,8 +104,10 @@ mainSteps:
               kubectl delete mutatingwebhookconfiguration -l app.kubernetes.io/managed-by=Helm --ignore-not-found 2>/dev/null || true
               # Force-clean Helm-managed namespaces
               force_clean_namespaces
-              # Clean stale PVCs from previous installs
-              kubectl delete pvc -n "$NAMESPACE" --all --ignore-not-found 2>/dev/null || true
+              # Clean stale PVCs (skip ones with keep resource policy — Helm expects those)
+              kubectl get pvc -n "$NAMESPACE" -o json 2>/dev/null | \
+                  python3 -c "import sys,json; d=json.load(sys.stdin); [print(i['metadata']['name']) for i in d.get('items',[]) if i.get('metadata',{}).get('annotations',{}).get('helm.sh/resource-policy','') != 'keep']" 2>/dev/null | \
+                  while read pvc; do kubectl delete pvc "$pvc" -n "$NAMESPACE" --ignore-not-found 2>/dev/null || true; done
           }
 
           # =========================================================
@@ -292,18 +294,6 @@ mainSteps:
           echo "Cleaning stale resources..."
           kubectl delete validatingwebhookconfiguration ingress-nginx-admission --ignore-not-found 2>/dev/null || true
           kubectl delete mutatingwebhookconfiguration ingress-nginx-admission --ignore-not-found 2>/dev/null || true
-
-          # Clean stale Nuclio CRDs and RBAC
-          kubectl delete crd \
-              nuclioapigateways.nuclio.io \
-              nucliofunctionevents.nuclio.io \
-              nucliofunctions.nuclio.io \
-              nuclioprojects.nuclio.io \
-              --ignore-not-found 2>/dev/null || true
-          kubectl delete clusterrole -l app.kubernetes.io/name=nuclio --ignore-not-found 2>/dev/null || true
-          kubectl delete clusterrolebinding -l app.kubernetes.io/name=nuclio --ignore-not-found 2>/dev/null || true
-          kubectl delete sa,role,rolebinding -n "$NAMESPACE" -l app.kubernetes.io/name=nuclio --ignore-not-found 2>/dev/null || true
-          kubectl delete deploy,svc -n "$NAMESPACE" -l app.kubernetes.io/name=nuclio --ignore-not-found 2>/dev/null || true
 
           # Force-clean any terminating namespaces from previous failed runs
           force_clean_namespaces
