@@ -123,11 +123,13 @@ mainSteps:
                       [ -n "$ip" ] && CP_IPS+=("$ip")
                   done < <(kubectl get nodes -l node-role.kubernetes.io/control-plane -o jsonpath='{range .items[*]}{.status.addresses[?(@.type=="InternalIP")].address}{"\n"}{end}' 2>/dev/null)
               fi
-              # Fallback to known hostnames
+              # Fallback to known hostnames (IPv4 only)
               if [ ${#CP_IPS[@]} -eq 0 ]; then
                   for h in vausk01 vausk02 vausk03; do
                       ip=$(getent hosts "$h" 2>/dev/null | awk '{print $1}' | head -1)
-                      [ -n "$ip" ] && CP_IPS+=("$ip")
+                      if [[ -n "$ip" && "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+                          CP_IPS+=("$ip")
+                      fi
                   done
               fi
               # Final fallback to local IP
@@ -407,11 +409,13 @@ mainSteps:
                   done < <(kubectl get nodes -l node-role.kubernetes.io/control-plane -o jsonpath='{range .items[*]}{.status.addresses[?(@.type=="InternalIP")].address}{"\n"}{end}' 2>/dev/null)
               fi
 
-              # Fallback to known hostnames
+              # Fallback to known hostnames (IPv4 only)
               if [ ${#CP_IPS[@]} -eq 0 ]; then
                   for h in vausk01 vausk02 vausk03; do
                       ip=$(getent hosts "$h" 2>/dev/null | awk '{print $1}' | head -1)
-                      [ -n "$ip" ] && CP_IPS+=("$ip")
+                      if [[ -n "$ip" && "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+                          CP_IPS+=("$ip")
+                      fi
                   done
               fi
 
