@@ -417,6 +417,9 @@ mainSteps:
                   echo "Cluster initialization complete!"
 
                   # Setup kubectl for root
+                  mkdir -p /root/.kube
+                  cp -f /etc/kubernetes/admin.conf /root/.kube/config
+                  chmod 600 /root/.kube/config
                   export KUBECONFIG=/etc/kubernetes/admin.conf
 
                   # Remove control-plane NoSchedule taint — bare-metal CPs run workloads
@@ -428,10 +431,10 @@ mainSteps:
                   echo "Generating and storing join token in Secrets Manager..."
 
                   # Generate certificate key for control plane joining
-                  CERT_KEY=$(sudo kubeadm init phase upload-certs --upload-certs 2>/dev/null | tail -1)
+                  CERT_KEY=$(kubeadm init phase upload-certs --upload-certs 2>/dev/null | tail -1)
 
                   # Generate join command
-                  JOIN_CMD=$(sudo kubeadm token create --print-join-command)
+                  JOIN_CMD=$(kubeadm token create --print-join-command)
 
                   # Calculate expiration (24 hours from now)
                   EXPIRES_AT=$(date -d "+24 hours" -Iseconds)
