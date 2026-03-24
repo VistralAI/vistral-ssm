@@ -225,8 +225,16 @@ mainSteps:
 
           if [ -f charts/longhorn-*.tgz ]; then
               echo "  Longhorn CRDs..."
-              helm template longhorn-crds charts/longhorn-*.tgz --show-only templates/crds.yaml 2>/dev/null \
+              LONGHORN_TGZ=$(ls charts/longhorn-*.tgz)
+              helm template longhorn-crds "$LONGHORN_TGZ" --show-only templates/crds.yaml 2>/dev/null \
                   | kubectl apply --server-side --force-conflicts -f - 2>/dev/null || true
+              # Remove crds.yaml from the tarball so Helm doesn't try to manage them
+              # (Longhorn puts CRDs in templates/ with no conditional, --skip-crds doesn't apply)
+              CRD_REPACK=$(mktemp -d)
+              tar xzf "$LONGHORN_TGZ" -C "$CRD_REPACK"
+              rm -f "$CRD_REPACK/longhorn/templates/crds.yaml"
+              tar czf "$LONGHORN_TGZ" -C "$CRD_REPACK" longhorn
+              rm -rf "$CRD_REPACK"
           fi
 
           if [ -f charts/keda-*.tgz ]; then
