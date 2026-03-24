@@ -208,42 +208,40 @@ mainSteps:
           # We extract and apply them directly to survive install/uninstall cycles.
 
           echo "Pre-installing CRDs from subcharts..."
-          CRD_TMP=$(mktemp -d)
+
+          # Apply CRDs and label them with Helm ownership so Helm can adopt them.
+          # Without these labels, Helm refuses to manage pre-existing CRDs.
+          apply_crds_with_helm_labels() {
+              kubectl apply --server-side --force-conflicts -f - 2>/dev/null || true
+              # Label all CRDs owned by this release so Helm can adopt them
+              kubectl get crd -o name 2>/dev/null | while read crd; do
+                  kubectl label "$crd" app.kubernetes.io/managed-by=Helm --overwrite 2>/dev/null || true
+                  kubectl annotate "$crd" meta.helm.sh/release-name=vistral-platform meta.helm.sh/release-namespace="$NAMESPACE" --overwrite 2>/dev/null || true
+              done
+          }
 
           # Longhorn CRDs
           if [ -f charts/longhorn-*.tgz ]; then
-              echo "  Extracting Longhorn CRDs..."
-              tar xzf charts/longhorn-*.tgz -C "$CRD_TMP" longhorn/templates/crds.yaml 2>/dev/null || true
-              if [ -f "$CRD_TMP/longhorn/templates/crds.yaml" ]; then
-                  # The crds.yaml has Helm template directives, use helm template to render
-                  helm template longhorn-crds charts/longhorn-*.tgz --show-only templates/crds.yaml 2>/dev/null \
-                      | kubectl apply --server-side --force-conflicts -f - 2>/dev/null || true
-              fi
+              echo "  Longhorn CRDs..."
+              helm template longhorn-crds charts/longhorn-*.tgz --show-only templates/crds.yaml 2>/dev/null \
+                  | apply_crds_with_helm_labels
           fi
 
           # KEDA CRDs
           if [ -f charts/keda-*.tgz ]; then
-              echo "  Extracting KEDA CRDs..."
+              echo "  KEDA CRDs..."
               helm template keda-crds charts/keda-*.tgz --show-only templates/crds/*.yaml 2>/dev/null \
-                  | kubectl apply --server-side --force-conflicts -f - 2>/dev/null || true
+                  | apply_crds_with_helm_labels
           fi
 
           # External Secrets CRDs
           if [ -f charts/external-secrets-*.tgz ]; then
-              echo "  Extracting External Secrets CRDs..."
+              echo "  External Secrets CRDs..."
               helm template es-crds charts/external-secrets-*.tgz --show-only templates/crds/*.yaml \
                   --set installCRDs=true 2>/dev/null \
-                  | kubectl apply --server-side --force-conflicts -f - 2>/dev/null || true
+                  | apply_crds_with_helm_labels
           fi
 
-          # GPU Operator CRDs (these are in crds/ so Helm handles them, but apply anyway for safety)
-          if [ -f charts/gpu-operator-*.tgz ]; then
-              echo "  Extracting GPU Operator CRDs..."
-              tar xzf charts/gpu-operator-*.tgz -C "$CRD_TMP" --wildcards '*/crds/*.yaml' 2>/dev/null || true
-              find "$CRD_TMP" -name '*.yaml' -path '*/crds/*' -exec kubectl apply --server-side --force-conflicts -f {} \; 2>/dev/null || true
-          fi
-
-          rm -rf "$CRD_TMP"
           echo "CRDs pre-installed"
 
           # =========================================================
