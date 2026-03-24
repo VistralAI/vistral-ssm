@@ -256,28 +256,7 @@ mainSteps:
 
           kubectl create namespace "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
 
-          echo "Bootstrapping secrets..."
-
-          create_secret() {
-              local ns="$1" name="$2"; shift 2
-              if ! kubectl get secret "$name" -n "$ns" &>/dev/null; then
-                  echo "  Creating secret $ns/$name"
-                  kubectl create secret generic "$name" -n "$ns" "$@"
-              fi
-          }
-
-          create_secret "$NAMESPACE" redis-credentials \
-              --from-literal=password=changeme \
-              --from-literal=redis-password=changeme
-
-          create_secret "$NAMESPACE" postgresql-credentials \
-              --from-literal=postgresql-password=changeme \
-              --from-literal=postgres-password=changeme \
-              --from-literal=password=changeme
-
-          create_secret "$NAMESPACE" cvat-analytics-secret \
-              --from-literal=secret-key=changeme-analytics-key \
-              --from-literal=CLICKHOUSE_PASSWORD=changeme
+          echo "Secrets managed by External Secrets Operator (source: AWS Secrets Manager vistral-db-passwords)"
 
           # =========================================================
           # Pre-install cleanup
