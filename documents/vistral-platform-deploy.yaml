@@ -132,11 +132,10 @@ mainSteps:
           # Create namespace
           kubectl create namespace "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
 
-          # Bootstrap secrets (idempotent — only creates if missing)
+          # Bootstrap secrets in the release namespace only
+          # Other namespaces (cvat, automation, video-processing) are created by Helm
+          # and must not be pre-created or Helm will refuse to adopt them
           echo "Bootstrapping secrets..."
-          for ns in "$NAMESPACE" cvat automation video-processing; do
-              kubectl create namespace "$ns" --dry-run=client -o yaml | kubectl apply -f - 2>/dev/null || true
-          done
 
           create_secret() {
               local ns="$1" name="$2"; shift 2
