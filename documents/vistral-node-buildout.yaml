@@ -23,9 +23,13 @@ parameters:
   InstanceId:
     type: String
     description: "Target instance ID (hybrid managed instance)"
-  DeployKeySecretName:
+  ClusterDeployKeySecretName:
     type: String
-    description: "AWS Secrets Manager secret name containing GitHub deploy key"
+    description: "AWS Secrets Manager secret for vistral-cluster repo"
+    default: "vistral-github-deploy-key"
+  PlatformDeployKeySecretName:
+    type: String
+    description: "AWS Secrets Manager secret for vistral-platform-v3 repo"
     default: "vistral-github-deploy-key-platform"
   JoinTokenSecretName:
     type: String
@@ -87,7 +91,7 @@ mainSteps:
         - "{{InstanceId}}"
       Parameters:
         DeployKeySecretName:
-          - "{{DeployKeySecretName}}"
+          - "{{ClusterDeployKeySecretName}}"
         JoinTokenSecretName:
           - "{{JoinTokenSecretName}}"
         VipAddress:
@@ -161,7 +165,7 @@ mainSteps:
         - "{{InstanceId}}"
       Parameters:
         DeployKeySecretName:
-          - "{{DeployKeySecretName}}"
+          - "{{PlatformDeployKeySecretName}}"
         PlatformRepo:
           - "{{PlatformRepo}}"
         AWSRegion:
