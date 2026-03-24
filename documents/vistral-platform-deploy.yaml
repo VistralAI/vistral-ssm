@@ -50,6 +50,8 @@ mainSteps:
           AWS_REGION="{{AWSRegion}}"
           NAMESPACE="{{Namespace}}"
           VALUES_OVERRIDE="{{ValuesOverride}}"
+          CHART_DIR="/opt/vistral-platform-v3"
+          HELM_MANAGED_NAMESPACES="cvat automation video-processing"
 
           LOG="/var/log/vistral-platform-deploy.log"
           exec > >(tee -a "$LOG") 2>&1
@@ -57,6 +59,50 @@ mainSteps:
           echo "=============================================="
           echo "Platform Deployment - $(date)"
           echo "=============================================="
+
+          # =========================================================
+          # Helper: force-clean namespaces (strip finalizers + wait)
+          # =========================================================
+          force_clean_namespaces() {
+              for ns in $HELM_MANAGED_NAMESPACES; do
+                  if ! kubectl get namespace "$ns" &>/dev/null; then
+                      continue
+                  fi
+                  echo "  Cleaning namespace $ns..."
+                  # Strip all finalizers from resources in this namespace
+                  for resource in $(kubectl api-resources --verbs=list --namespaced -o name 2>/dev/null); do
+                      kubectl get "$resource" -n "$ns" -o name 2>/dev/null | while read obj; do
+                          kubectl patch "$obj" -n "$ns" --type merge -p '{"metadata":{"finalizers":null}}' 2>/dev/null || true
+                      done
+                  done
+                  # Delete the namespace if it's still around
+                  kubectl delete namespace "$ns" --ignore-not-found --timeout=30s 2>/dev/null || true
+                  # Wait for it to fully disappear
+                  kubectl wait --for=delete namespace/"$ns" --timeout=120s 2>/dev/null || true
+              done
+          }
+
+          # =========================================================
+          # Helper: full release cleanup after failure
+          # =========================================================
+          cleanup_failed_release() {
+              echo "Cleaning up failed release..."
+              helm uninstall vistral-platform -n "$NAMESPACE" --no-hooks 2>/dev/null || true
+              # Clean webhooks that block future installs
+              kubectl delete validatingwebhookconfiguration ingress-nginx-admission --ignore-not-found 2>/dev/null || true
+              kubectl delete mutatingwebhookconfiguration ingress-nginx-admission --ignore-not-found 2>/dev/null || true
+              # Clean any operator webhooks that might be stale
+              kubectl delete validatingwebhookconfiguration -l app.kubernetes.io/managed-by=Helm --ignore-not-found 2>/dev/null || true
+              kubectl delete mutatingwebhookconfiguration -l app.kubernetes.io/managed-by=Helm --ignore-not-found 2>/dev/null || true
+              # Force-clean Helm-managed namespaces
+              force_clean_namespaces
+              # Clean stale PVCs from previous installs (keep resource policy leaves these)
+              kubectl delete pvc -n "$NAMESPACE" -l app.kubernetes.io/managed-by=Helm --ignore-not-found 2>/dev/null || true
+          }
+
+          # =========================================================
+          # Guards
+          # =========================================================
 
           # Must be primary control plane
           if [ ! -f /etc/kubernetes/admin.conf ]; then
@@ -78,42 +124,31 @@ mainSteps:
               if [ "$RELEASE_STATUS" = "deployed" ]; then
                   echo "Platform already deployed (status: $RELEASE_STATUS). Skipping."
                   exit 0
-              elif [ "$RELEASE_STATUS" = "failed" ] || [ "$RELEASE_STATUS" = "pending-install" ] || [ "$RELEASE_STATUS" = "uninstalling" ]; then
+              elif [ "$RELEASE_STATUS" = "failed" ] || [ "$RELEASE_STATUS" = "pending-install" ] || [ "$RELEASE_STATUS" = "pending-rollback" ] || [ "$RELEASE_STATUS" = "uninstalling" ]; then
                   echo "Platform in broken state: $RELEASE_STATUS. Cleaning up before retry..."
-                  helm uninstall vistral-platform -n "$NAMESPACE" --no-hooks --wait --timeout 2m 2>/dev/null || true
-                  # Delete any webhook that blocks ingress creation
-                  kubectl delete validatingwebhookconfiguration ingress-nginx-admission 2>/dev/null || true
+                  cleanup_failed_release
               else
                   echo "Platform exists but status: $RELEASE_STATUS. Will attempt upgrade."
               fi
           fi
 
-          # Install prerequisites
+          # =========================================================
+          # Prerequisites
+          # =========================================================
+
           if ! command -v aws &>/dev/null; then
+              echo "Installing AWS CLI v2..."
               cd /tmp
               curl -sL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
               unzip -q awscliv2.zip
               ./aws/install --update
               rm -rf awscliv2.zip aws
-              cd -
           fi
 
           if ! command -v helm &>/dev/null; then
+              echo "Installing Helm..."
               curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
           fi
-
-          # Get deploy key
-          DEPLOY_KEY=$(aws secretsmanager get-secret-value \
-              --secret-id "$DEPLOY_KEY_SECRET" \
-              --region "$AWS_REGION" \
-              --query SecretString \
-              --output text) || { echo "ERROR: Failed to get deploy key"; exit 1; }
-
-          mkdir -p ~/.ssh
-          echo "$DEPLOY_KEY" > ~/.ssh/github_deploy
-          chmod 600 ~/.ssh/github_deploy
-          ssh-keyscan github.com >> ~/.ssh/known_hosts 2>/dev/null
-          export GIT_SSH_COMMAND="ssh -i ~/.ssh/github_deploy -o StrictHostKeyChecking=no"
 
           # Host prerequisites — Longhorn needs iSCSI
           echo "Checking host prerequisites..."
@@ -129,15 +164,33 @@ mainSteps:
               echo "iscsi_tcp" > /etc/modules-load.d/iscsi.conf 2>/dev/null || true
           fi
 
-          # Clone platform repo
+          # =========================================================
+          # Clone & build
+          # =========================================================
+
+          # Get deploy key
+          DEPLOY_KEY=$(aws secretsmanager get-secret-value \
+              --secret-id "$DEPLOY_KEY_SECRET" \
+              --region "$AWS_REGION" \
+              --query SecretString \
+              --output text) || { echo "ERROR: Failed to get deploy key"; exit 1; }
+
+          mkdir -p ~/.ssh
+          echo "$DEPLOY_KEY" > ~/.ssh/github_deploy
+          chmod 600 ~/.ssh/github_deploy
+          ssh-keyscan github.com >> ~/.ssh/known_hosts 2>/dev/null
+          export GIT_SSH_COMMAND="ssh -i ~/.ssh/github_deploy -o StrictHostKeyChecking=no"
+
           echo "Cloning vistral-platform-v3..."
-          rm -rf /opt/vistral-platform-v3
-          git clone "$PLATFORM_REPO" /opt/vistral-platform-v3 || {
+          rm -rf "$CHART_DIR"
+          git clone "$PLATFORM_REPO" "$CHART_DIR" || {
               echo "ERROR: Failed to clone platform repo"
               rm -f ~/.ssh/github_deploy
               exit 1
           }
-          cd /opt/vistral-platform-v3
+
+          # Always cd to chart dir with absolute path (avoids getwd errors)
+          cd "$CHART_DIR"
 
           # Build Helm dependencies (skip if already vendored in charts/)
           if [ -d charts ] && ls charts/*.tgz &>/dev/null; then
@@ -147,12 +200,12 @@ mainSteps:
               helm dependency build 2>/dev/null || helm dependency update
           fi
 
-          # Create namespace
+          # =========================================================
+          # Bootstrap secrets (release namespace only)
+          # =========================================================
+
           kubectl create namespace "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
 
-          # Bootstrap secrets in the release namespace only
-          # Other namespaces (cvat, automation, video-processing) are created by Helm
-          # and must not be pre-created or Helm will refuse to adopt them
           echo "Bootstrapping secrets..."
 
           create_secret() {
@@ -176,6 +229,10 @@ mainSteps:
               --from-literal=secret-key=changeme-analytics-key \
               --from-literal=CLICKHOUSE_PASSWORD=changeme
 
+          # =========================================================
+          # Pre-install cleanup
+          # =========================================================
+
           # Prepare values override
           VALUES_ARGS="-f values.yaml"
           if [ -n "$VALUES_OVERRIDE" ]; then
@@ -183,55 +240,40 @@ mainSteps:
               VALUES_ARGS="$VALUES_ARGS -f /tmp/override-values.yaml"
           fi
 
-          # Clean stale resources from previous failed installs
-          echo "Cleaning stale admission webhooks..."
+          # Clean stale admission webhooks
+          echo "Cleaning stale resources..."
           kubectl delete validatingwebhookconfiguration ingress-nginx-admission --ignore-not-found 2>/dev/null || true
+          kubectl delete mutatingwebhookconfiguration ingress-nginx-admission --ignore-not-found 2>/dev/null || true
 
-          echo "Cleaning stale Nuclio CRDs..."
+          # Clean stale Nuclio CRDs and RBAC
           kubectl delete crd \
               nuclioapigateways.nuclio.io \
               nucliofunctionevents.nuclio.io \
               nucliofunctions.nuclio.io \
               nuclioprojects.nuclio.io \
               --ignore-not-found 2>/dev/null || true
-
-          # Clean stale Nuclio cluster-scoped RBAC resources
-          echo "Cleaning stale Nuclio RBAC..."
           kubectl delete clusterrole -l app.kubernetes.io/name=nuclio --ignore-not-found 2>/dev/null || true
           kubectl delete clusterrolebinding -l app.kubernetes.io/name=nuclio --ignore-not-found 2>/dev/null || true
           kubectl delete sa,role,rolebinding -n "$NAMESPACE" -l app.kubernetes.io/name=nuclio --ignore-not-found 2>/dev/null || true
           kubectl delete deploy,svc -n "$NAMESPACE" -l app.kubernetes.io/name=nuclio --ignore-not-found 2>/dev/null || true
 
-          # Wait for any terminating namespaces from previous failed runs
-          for ns in cvat automation video-processing; do
-              if kubectl get namespace "$ns" &>/dev/null; then
-                  STATUS=$(kubectl get namespace "$ns" -o jsonpath='{.status.phase}' 2>/dev/null)
-                  if [ "$STATUS" = "Terminating" ]; then
-                      echo "Waiting for namespace $ns to finish terminating..."
-                      kubectl wait --for=delete namespace/"$ns" --timeout=120s 2>/dev/null || true
-                  fi
-              fi
-          done
+          # Force-clean any terminating namespaces from previous failed runs
+          force_clean_namespaces
 
-          # Phase 1: Install operators and infrastructure (skip CRD-dependent custom resources)
+          # =========================================================
+          # Phase 1: Install operators (CRDs first, skip custom resources)
+          # =========================================================
+
           echo "Phase 1: Installing operators (CRDs)..."
-          cd /opt/vistral-platform-v3
+          cd "$CHART_DIR"
           if ! helm upgrade --install vistral-platform . \
               --namespace "$NAMESPACE" \
               --create-namespace \
               $VALUES_ARGS \
               --set global.skipCustomResources=true \
               --timeout 10m; then
-              echo "Phase 1 failed. Cleaning up broken release..."
-              helm uninstall vistral-platform -n "$NAMESPACE" --no-hooks 2>/dev/null || true
-              kubectl delete validatingwebhookconfiguration ingress-nginx-admission --ignore-not-found 2>/dev/null || true
-              # Wait for Helm-created namespaces to fully terminate so next retry is clean
-              for ns in cvat automation video-processing; do
-                  if kubectl get namespace "$ns" &>/dev/null; then
-                      echo "  Waiting for namespace $ns to terminate..."
-                      kubectl wait --for=delete namespace/"$ns" --timeout=120s 2>/dev/null || true
-                  fi
-              done
+              echo "Phase 1 failed."
+              cleanup_failed_release
               exit 1
           fi
 
@@ -250,30 +292,30 @@ mainSteps:
               done
           done
 
+          # =========================================================
           # Phase 2: Full deploy with custom resources enabled
+          # =========================================================
+
           echo "Phase 2: Full platform deployment..."
+          cd "$CHART_DIR"
           if ! helm upgrade vistral-platform . \
               --namespace "$NAMESPACE" \
               $VALUES_ARGS \
               --wait --timeout 15m; then
-              echo "Phase 2 failed. Cleaning up broken release..."
-              helm uninstall vistral-platform -n "$NAMESPACE" --no-hooks 2>/dev/null || true
-              kubectl delete validatingwebhookconfiguration ingress-nginx-admission --ignore-not-found 2>/dev/null || true
-              for ns in cvat automation video-processing; do
-                  if kubectl get namespace "$ns" &>/dev/null; then
-                      echo "  Waiting for namespace $ns to terminate..."
-                      kubectl wait --for=delete namespace/"$ns" --timeout=120s 2>/dev/null || true
-                  fi
-              done
+              echo "Phase 2 failed."
+              cleanup_failed_release
               exit 1
           fi
 
           echo "Platform deployment complete"
 
-          # Bootstrap ArgoCD if install script exists
+          # =========================================================
+          # Post-deploy: ArgoCD bootstrap
+          # =========================================================
+
           if [ -f argocd/install.sh ]; then
               echo "Bootstrapping ArgoCD..."
-              cd argocd
+              cd "$CHART_DIR/argocd"
               chmod +x install.sh
               bash install.sh
               echo "ArgoCD bootstrap complete"
