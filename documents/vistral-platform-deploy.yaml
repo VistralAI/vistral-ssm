@@ -37,7 +37,7 @@ mainSteps:
   - action: aws:runShellScript
     name: deployPlatform
     inputs:
-      timeoutSeconds: 1800
+      timeoutSeconds: 2400
       runCommand:
         - |
           #!/bin/bash
@@ -347,7 +347,7 @@ mainSteps:
               --set longhorn.enableCRDs=false \
               --set keda.crds.install=false \
               --set external-secrets.installCRDs=false \
-              --wait --timeout 15m; then
+              --wait --timeout 25m; then
               echo "Phase 2 failed."
               cleanup_failed_release
               exit 1
