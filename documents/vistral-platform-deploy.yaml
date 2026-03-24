@@ -139,6 +139,25 @@ mainSteps:
               VALUES_ARGS="$VALUES_ARGS -f /tmp/override-values.yaml"
           fi
 
+          # Clean stale resources from previous failed installs
+          echo "Cleaning stale admission webhooks..."
+          kubectl delete validatingwebhookconfiguration ingress-nginx-admission --ignore-not-found 2>/dev/null || true
+
+          echo "Cleaning stale Nuclio CRDs..."
+          kubectl delete crd \
+              nuclioapigateways.nuclio.io \
+              nucliofunctionevents.nuclio.io \
+              nucliofunctions.nuclio.io \
+              nuclioprojects.nuclio.io \
+              --ignore-not-found 2>/dev/null || true
+
+          # Clean stale Nuclio cluster-scoped RBAC resources
+          echo "Cleaning stale Nuclio RBAC..."
+          kubectl delete clusterrole -l app.kubernetes.io/name=nuclio --ignore-not-found 2>/dev/null || true
+          kubectl delete clusterrolebinding -l app.kubernetes.io/name=nuclio --ignore-not-found 2>/dev/null || true
+          kubectl delete sa,role,rolebinding -n "$NAMESPACE" -l app.kubernetes.io/name=nuclio --ignore-not-found 2>/dev/null || true
+          kubectl delete deploy,svc -n "$NAMESPACE" -l app.kubernetes.io/name=nuclio --ignore-not-found 2>/dev/null || true
+
           # Phase 1: Install operators and infrastructure (skip CRD-dependent custom resources)
           echo "Phase 1: Installing operators (CRDs)..."
           if ! helm upgrade --install vistral-platform . \
