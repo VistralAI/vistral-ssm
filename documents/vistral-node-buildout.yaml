@@ -77,7 +77,7 @@ mainSteps:
   - name: waitForReboot
     action: aws:sleep
     inputs:
-      Duration: PT180S
+      Duration: PT90S
 
   # Step 3: Join Kubernetes cluster (or auto-reset + rejoin if stale)
   - name: k8sJoin
