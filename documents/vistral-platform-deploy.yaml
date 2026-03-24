@@ -215,6 +215,7 @@ mainSteps:
 
           # Phase 1: Install operators and infrastructure (skip CRD-dependent custom resources)
           echo "Phase 1: Installing operators (CRDs)..."
+          cd /opt/vistral-platform-v3
           if ! helm upgrade --install vistral-platform . \
               --namespace "$NAMESPACE" \
               --create-namespace \
