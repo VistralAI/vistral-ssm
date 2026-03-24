@@ -202,6 +202,17 @@ mainSteps:
           kubectl delete sa,role,rolebinding -n "$NAMESPACE" -l app.kubernetes.io/name=nuclio --ignore-not-found 2>/dev/null || true
           kubectl delete deploy,svc -n "$NAMESPACE" -l app.kubernetes.io/name=nuclio --ignore-not-found 2>/dev/null || true
 
+          # Wait for any terminating namespaces from previous failed runs
+          for ns in cvat automation video-processing; do
+              if kubectl get namespace "$ns" &>/dev/null; then
+                  STATUS=$(kubectl get namespace "$ns" -o jsonpath='{.status.phase}' 2>/dev/null)
+                  if [ "$STATUS" = "Terminating" ]; then
+                      echo "Waiting for namespace $ns to finish terminating..."
+                      kubectl wait --for=delete namespace/"$ns" --timeout=120s 2>/dev/null || true
+                  fi
+              fi
+          done
+
           # Phase 1: Install operators and infrastructure (skip CRD-dependent custom resources)
           echo "Phase 1: Installing operators (CRDs)..."
           if ! helm upgrade --install vistral-platform . \
