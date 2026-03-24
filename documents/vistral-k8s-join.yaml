@@ -142,6 +142,15 @@ mainSteps:
               fi
           fi
 
+          # Detect partial kubeadm init (port 6443 bound but no kubelet.conf)
+          if [ ! -f /etc/kubernetes/kubelet.conf ] && ss -tlnp | grep -q ':6443 '; then
+              echo "Detected partial kubeadm init (port 6443 in use, no kubelet.conf). Resetting..."
+              kubeadm reset -f 2>/dev/null || true
+              rm -rf /etc/kubernetes/ /var/lib/kubelet/ /var/lib/etcd/ /etc/cni/net.d/ $HOME/.kube/
+              systemctl restart containerd 2>/dev/null || true
+              echo "Partial init cleaned up."
+          fi
+
           # Determine role from hostname
           if [[ "$HOSTNAME" =~ ^vausk[0-9]+$ ]]; then
               ROLE="control-plane"
@@ -167,6 +176,14 @@ mainSteps:
 
           # Install prerequisites
           echo "Installing prerequisites..."
+          # Wait for any existing apt/dpkg operations to finish (e.g. apt-daily after reboot)
+          for i in $(seq 1 60); do
+              if ! fuser /var/lib/dpkg/lock-frontend &>/dev/null 2>&1; then
+                  break
+              fi
+              echo "  Waiting for dpkg lock... (${i}x5s)"
+              sleep 5
+          done
           apt-get update
           apt-get install -y git jq curl unzip
 
