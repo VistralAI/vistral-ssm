@@ -217,37 +217,29 @@ mainSteps:
 
           echo "Pre-installing CRDs from subcharts..."
 
-          # Apply CRDs and label them with Helm ownership so Helm can adopt them.
-          # Without these labels, Helm refuses to manage pre-existing CRDs.
-          apply_crds_with_helm_labels() {
-              kubectl apply --server-side --force-conflicts -f - 2>/dev/null || true
-              # Label all CRDs owned by this release so Helm can adopt them
-              kubectl get crd -o name 2>/dev/null | while read crd; do
-                  kubectl label "$crd" app.kubernetes.io/managed-by=Helm --overwrite 2>/dev/null || true
-                  kubectl annotate "$crd" meta.helm.sh/release-name=vistral-platform meta.helm.sh/release-namespace="$NAMESPACE" --overwrite 2>/dev/null || true
-              done
-          }
+          # We manage CRDs outside Helm because:
+          # 1. Some charts put CRDs in templates/ which get deleted on helm uninstall
+          # 2. Helm doesn't reinstall CRDs on upgrade
+          # 3. Helm refuses to adopt pre-existing CRDs without ownership labels
+          # Solution: apply CRDs ourselves, tell Helm to --skip-crds
 
-          # Longhorn CRDs
           if [ -f charts/longhorn-*.tgz ]; then
               echo "  Longhorn CRDs..."
               helm template longhorn-crds charts/longhorn-*.tgz --show-only templates/crds.yaml 2>/dev/null \
-                  | apply_crds_with_helm_labels
+                  | kubectl apply --server-side --force-conflicts -f - 2>/dev/null || true
           fi
 
-          # KEDA CRDs
           if [ -f charts/keda-*.tgz ]; then
               echo "  KEDA CRDs..."
               helm template keda-crds charts/keda-*.tgz --show-only templates/crds/*.yaml 2>/dev/null \
-                  | apply_crds_with_helm_labels
+                  | kubectl apply --server-side --force-conflicts -f - 2>/dev/null || true
           fi
 
-          # External Secrets CRDs
           if [ -f charts/external-secrets-*.tgz ]; then
               echo "  External Secrets CRDs..."
               helm template es-crds charts/external-secrets-*.tgz --show-only templates/crds/*.yaml \
                   --set installCRDs=true 2>/dev/null \
-                  | apply_crds_with_helm_labels
+                  | kubectl apply --server-side --force-conflicts -f - 2>/dev/null || true
           fi
 
           echo "CRDs pre-installed"
@@ -321,8 +313,12 @@ mainSteps:
           if ! helm upgrade --install vistral-platform . \
               --namespace "$NAMESPACE" \
               --create-namespace \
+              --skip-crds \
               $VALUES_ARGS \
               --set global.skipCustomResources=true \
+              --set longhorn.enableCRDs=false \
+              --set keda.crds.install=false \
+              --set external-secrets.installCRDs=false \
               --timeout 10m; then
               echo "Phase 1 failed."
               cleanup_failed_release
@@ -352,7 +348,11 @@ mainSteps:
           cd "$CHART_DIR"
           if ! helm upgrade vistral-platform . \
               --namespace "$NAMESPACE" \
+              --skip-crds \
               $VALUES_ARGS \
+              --set longhorn.enableCRDs=false \
+              --set keda.crds.install=false \
+              --set external-secrets.installCRDs=false \
               --wait --timeout 15m; then
               echo "Phase 2 failed."
               cleanup_failed_release
