@@ -255,17 +255,39 @@ mainSteps:
                   --output text 2>/dev/null || echo "")
 
               if [ -n "$TOKEN_JSON" ]; then
-                  # Check if token is expired
-                  local EXPIRES_AT=$(echo "$TOKEN_JSON" | jq -r '.expiresAt // empty')
-                  if [ -n "$EXPIRES_AT" ]; then
-                      local EXPIRES_EPOCH=$(date -d "$EXPIRES_AT" +%s 2>/dev/null || echo "0")
+                  # Validate JSON before parsing
+                  if ! echo "$TOKEN_JSON" | jq empty 2>/dev/null; then
+                      echo "WARNING: Invalid JSON in token secret, requesting new token..." >&2
+                  else
+                      # Check if token is expired or stale (>1h old)
+                      local EXPIRES_AT=$(echo "$TOKEN_JSON" | jq -r '.expiresAt // empty')
+                      local GENERATED_AT=$(echo "$TOKEN_JSON" | jq -r '.generatedAt // empty')
                       local NOW_EPOCH=$(date +%s)
-                      if [ "$NOW_EPOCH" -lt "$EXPIRES_EPOCH" ]; then
-                          echo "Found valid join token (expires: $EXPIRES_AT)" >&2
-                          echo "$TOKEN_JSON"
-                          return 0
-                      else
-                          echo "Join token expired, requesting new one..." >&2
+
+                      if [ -n "$GENERATED_AT" ]; then
+                          local GEN_EPOCH=$(date -d "$GENERATED_AT" +%s 2>/dev/null || echo "0")
+                          local AGE=$(( NOW_EPOCH - GEN_EPOCH ))
+                          if [ "$AGE" -gt 3600 ]; then
+                              echo "Token is ${AGE}s old (>1h), requesting fresh token..." >&2
+                          elif [ -n "$EXPIRES_AT" ]; then
+                              local EXPIRES_EPOCH=$(date -d "$EXPIRES_AT" +%s 2>/dev/null || echo "0")
+                              if [ "$NOW_EPOCH" -lt "$EXPIRES_EPOCH" ]; then
+                                  echo "Found valid join token (expires: $EXPIRES_AT, age: ${AGE}s)" >&2
+                                  echo "$TOKEN_JSON"
+                                  return 0
+                              else
+                                  echo "Join token expired, requesting new one..." >&2
+                              fi
+                          fi
+                      elif [ -n "$EXPIRES_AT" ]; then
+                          local EXPIRES_EPOCH=$(date -d "$EXPIRES_AT" +%s 2>/dev/null || echo "0")
+                          if [ "$NOW_EPOCH" -lt "$EXPIRES_EPOCH" ]; then
+                              echo "Found valid join token (expires: $EXPIRES_AT)" >&2
+                              echo "$TOKEN_JSON"
+                              return 0
+                          else
+                              echo "Join token expired, requesting new one..." >&2
+                          fi
                       fi
                   fi
               fi
@@ -319,6 +341,10 @@ mainSteps:
                       --output text 2>/dev/null || echo "")
 
                   if [ -n "$TOKEN_JSON" ]; then
+                      if ! echo "$TOKEN_JSON" | jq empty 2>/dev/null; then
+                          echo "  Token not yet valid JSON, retrying..." >&2
+                          continue
+                      fi
                       local GENERATED_AT=$(echo "$TOKEN_JSON" | jq -r '.generatedAt // empty')
                       if [ -n "$GENERATED_AT" ]; then
                           echo "Join token received (generated: $GENERATED_AT)" >&2
@@ -587,8 +613,12 @@ mainSteps:
                                           --region "$AWS_REGION" \
                                           --query SecretString \
                                           --output text 2>/dev/null || echo "")
-                                      JOIN_CMD=$(echo "$JOIN_INFO" | jq -r '.joinCommand')
-                                      CERT_KEY=$(echo "$JOIN_INFO" | jq -r '.certKey')
+                                      if echo "$JOIN_INFO" | jq empty 2>/dev/null; then
+                                          JOIN_CMD=$(echo "$JOIN_INFO" | jq -r '.joinCommand')
+                                          CERT_KEY=$(echo "$JOIN_INFO" | jq -r '.certKey')
+                                      else
+                                          echo "WARNING: Invalid JSON from token secret after refresh"
+                                      fi
                                       break
                                   elif [ "$STATUS" = "Failed" ]; then
                                       echo "WARNING: Certificate refresh failed"

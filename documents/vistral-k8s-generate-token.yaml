@@ -20,8 +20,8 @@ parameters:
     default: "us-east-1"
   TokenTTL:
     type: String
-    description: "Token time-to-live (kubeadm format, e.g., 2h)"
-    default: "2h"
+    description: "Token time-to-live (kubeadm format, e.g., 24h)"
+    default: "24h"
 
 mainSteps:
   - action: aws:runShellScript
