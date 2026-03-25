@@ -8,8 +8,9 @@ description: |
   3. Configures GPU time-slicing (4 slices per T4)
   4. Verifies GPU device detection in K8s
 
-  Guard: Skips if no GPU detected or GPU Operator already running.
+  Guard: Skips if GPU Operator already running.
   Only runs on control plane nodes (needs kubectl/helm access).
+  Always installs GPU Operator so CRDs exist before GPU workers join.
 
 parameters:
   TimeSliceCount:
@@ -59,20 +60,7 @@ mainSteps:
                   exit 0
               fi
           else
-              # Check if any GPU worker nodes exist
-              GPU_NODES=$(kubectl get nodes -l vistral.ai/gpu=true -o name 2>/dev/null | wc -l)
-              if [ "$GPU_NODES" -eq 0 ]; then
-                  # Fallback: check if any vausw nodes exist
-                  GPU_NODES=$(kubectl get nodes -o name 2>/dev/null | grep -c "vausw" || true)
-                  GPU_NODES=${GPU_NODES:-0}
-              fi
-
-              if [ "$GPU_NODES" -eq 0 ]; then
-                  echo "No GPU worker nodes in cluster. Skipping GPU Operator."
-                  exit 0
-              fi
-
-              echo "Found $GPU_NODES GPU worker node(s). Installing GPU Operator..."
+              echo "Installing GPU Operator (pre-provisioning for GPU workers)..."
 
               # Ensure Helm is installed
               if ! command -v helm &>/dev/null; then
