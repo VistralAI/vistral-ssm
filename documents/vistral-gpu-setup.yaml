@@ -72,11 +72,13 @@ mainSteps:
               helm repo add nvidia https://helm.ngc.nvidia.com/nvidia 2>/dev/null || true
               helm repo update
 
-              # Install GPU Operator
+              # Install GPU Operator with R550 driver (supports both T4 and P4)
               helm install gpu-operator nvidia/gpu-operator \
                   --namespace gpu-operator \
                   --create-namespace \
                   --set driver.enabled=true \
+                  --set driver.version="550.163.01" \
+                  --set driver.repoConfig.configMapName="t2-repo-config" \
                   --set toolkit.enabled=true \
                   --set devicePlugin.enabled=true \
                   --set gfd.enabled=true \
@@ -85,6 +87,27 @@ mainSteps:
                   --wait --timeout 10m
 
               echo "GPU Operator installed"
+
+              # T2 Mac kernel headers fix:
+              # The driver container needs the T2 apt repo to download kernel
+              # headers for custom T2 kernels. The repo sources list is mounted
+              # via repoConfig above, but the GPG signing key also needs to be
+              # inside the container. Mount it from the host via hostPath.
+              echo "Configuring T2 kernel header support..."
+
+              # Create ConfigMap with T2 apt repo sources
+              kubectl create configmap t2-repo-config -n gpu-operator \
+                  --from-literal=t2.list="deb [signed-by=/etc/apt/trusted.gpg.d/t2-ubuntu-repo.gpg] https://adityagarg8.github.io/t2-ubuntu-repo ./
+          deb [signed-by=/etc/apt/trusted.gpg.d/t2-ubuntu-repo.gpg] https://github.com/AdityaGarg8/t2-ubuntu-repo/releases/download/noble ./" \
+                  --dry-run=client -o yaml | kubectl apply -f -
+
+              # Mount host T2 GPG key into driver container
+              kubectl patch ds nvidia-driver-daemonset -n gpu-operator --type=json -p '[
+                {"op":"add","path":"/spec/template/spec/volumes/-","value":{"name":"t2-gpg-key","hostPath":{"path":"/etc/apt/trusted.gpg.d/t2-ubuntu-repo.gpg","type":"File"}}},
+                {"op":"add","path":"/spec/template/spec/containers/0/volumeMounts/-","value":{"name":"t2-gpg-key","mountPath":"/etc/apt/trusted.gpg.d/t2-ubuntu-repo.gpg","readOnly":true}}
+              ]' 2>/dev/null || echo "DaemonSet patch skipped (may already be configured)"
+
+              echo "T2 kernel header support configured"
           fi
 
           # Configure GPU time-slicing
