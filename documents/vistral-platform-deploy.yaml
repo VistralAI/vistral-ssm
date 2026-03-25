@@ -91,7 +91,7 @@ mainSteps:
           # Helper: full release cleanup after failure
           # =========================================================
           cleanup_failed_release() {
-              echo "Cleaning up failed release..."
+              echo "Cleaning up failed release (preserving PVCs and namespaces)..."
               helm uninstall vistral-platform -n "$NAMESPACE" --no-hooks --wait=false 2>/dev/null || true
               # Clear stuck Helm operations (pending-install/pending-upgrade locks)
               kubectl delete secret -n "$NAMESPACE" -l owner=helm,status=pending-install --ignore-not-found 2>/dev/null || true
@@ -102,12 +102,8 @@ mainSteps:
               kubectl delete mutatingwebhookconfiguration ingress-nginx-admission --ignore-not-found 2>/dev/null || true
               kubectl delete validatingwebhookconfiguration -l app.kubernetes.io/managed-by=Helm --ignore-not-found 2>/dev/null || true
               kubectl delete mutatingwebhookconfiguration -l app.kubernetes.io/managed-by=Helm --ignore-not-found 2>/dev/null || true
-              # Force-clean Helm-managed namespaces
-              force_clean_namespaces
-              # Clean stale PVCs (skip ones with keep resource policy — Helm expects those)
-              kubectl get pvc -n "$NAMESPACE" -o json 2>/dev/null | \
-                  python3 -c "import sys,json; d=json.load(sys.stdin); [print(i['metadata']['name']) for i in d.get('items',[]) if i.get('metadata',{}).get('annotations',{}).get('helm.sh/resource-policy','') != 'keep']" 2>/dev/null | \
-                  while read pvc; do kubectl delete pvc "$pvc" -n "$NAMESPACE" --ignore-not-found 2>/dev/null || true; done
+              # NOTE: PVCs and namespaces are intentionally preserved on failure.
+              # Deleting them destroys database data and is unrecoverable.
           }
 
           # =========================================================
@@ -258,6 +254,39 @@ mainSteps:
 
           echo "Secrets managed by External Secrets Operator (source: AWS Secrets Manager vistral-db-passwords)"
 
+          # ESO needs AWS credentials to read from Secrets Manager
+          kubectl create namespace external-secrets --dry-run=client -o yaml | kubectl apply -f -
+          if ! kubectl get secret aws-credentials -n external-secrets &>/dev/null; then
+              echo "Creating AWS credentials for External Secrets Operator..."
+              ESO_ACCESS_KEY=$(aws secretsmanager get-secret-value --secret-id vistral/eso-credentials --region us-east-1 --query SecretString --output text 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['access-key-id'])" 2>/dev/null || echo "")
+              ESO_SECRET_KEY=$(aws secretsmanager get-secret-value --secret-id vistral/eso-credentials --region us-east-1 --query SecretString --output text 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['secret-access-key'])" 2>/dev/null || echo "")
+              if [ -n "$ESO_ACCESS_KEY" ] && [ -n "$ESO_SECRET_KEY" ]; then
+                  kubectl create secret generic aws-credentials \
+                      --namespace external-secrets \
+                      --from-literal=access-key-id="$ESO_ACCESS_KEY" \
+                      --from-literal=secret-access-key="$ESO_SECRET_KEY" \
+                      --dry-run=client -o yaml | kubectl apply -f -
+              else
+                  echo "WARNING: Could not fetch ESO credentials from vistral/eso-credentials"
+              fi
+          fi
+
+          # NGC image pull secret for NVIDIA container registry
+          if ! kubectl get secret ngc-secret -n "$NAMESPACE" &>/dev/null; then
+              echo "Creating NGC image pull secret..."
+              NGC_KEY=$(aws secretsmanager get-secret-value --secret-id vistral/ngc-api-key --region us-east-1 --query SecretString --output text 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['api-key'])" 2>/dev/null || echo "")
+              if [ -n "$NGC_KEY" ]; then
+                  kubectl create secret docker-registry ngc-secret \
+                      --namespace "$NAMESPACE" \
+                      --docker-server=nvcr.io \
+                      --docker-username='$oauthtoken' \
+                      --docker-password="$NGC_KEY" \
+                      --dry-run=client -o yaml | kubectl apply -f -
+              else
+                  echo "WARNING: Could not fetch NGC API key from vistral/ngc-api-key"
+              fi
+          fi
+
           # =========================================================
           # Pre-install cleanup
           # =========================================================
@@ -326,7 +355,7 @@ mainSteps:
               --set longhorn.enableCRDs=false \
               --set keda.crds.install=false \
               --set external-secrets.installCRDs=false \
-              --wait --timeout 45m; then
+              --timeout 45m; then
               echo "Phase 2 failed."
               cleanup_failed_release
               exit 1
