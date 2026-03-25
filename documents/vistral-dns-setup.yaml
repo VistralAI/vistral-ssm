@@ -385,6 +385,25 @@ mainSteps:
               mkdir -p /run/systemd/resolve
               ln -sf /etc/resolv.conf /run/systemd/resolve/resolv.conf
 
+              # Patch K8s CoreDNS to forward to external DNS instead of /etc/resolv.conf
+              # (Host resolv.conf has 127.0.0.1 which creates a DNS loop inside pods)
+              if command -v kubectl &>/dev/null && [ -f /etc/kubernetes/admin.conf ]; then
+                  export KUBECONFIG=/etc/kubernetes/admin.conf
+                  CURRENT_FORWARD=$(kubectl get configmap coredns -n kube-system -o jsonpath='{.data.Corefile}' 2>/dev/null | grep -c '/etc/resolv.conf' || true)
+                  if [ "$CURRENT_FORWARD" -gt 0 ]; then
+                      echo "Patching K8s CoreDNS to forward to 8.8.8.8 instead of /etc/resolv.conf..."
+                      COREFILE=$(kubectl get configmap coredns -n kube-system -o jsonpath='{.data.Corefile}' 2>/dev/null)
+                      PATCHED=$(echo "$COREFILE" | sed 's|forward \. /etc/resolv.conf|forward . 8.8.8.8 8.8.4.4|')
+                      kubectl patch configmap coredns -n kube-system --type=json \
+                          -p "[{\"op\":\"replace\",\"path\":\"/data/Corefile\",\"value\":$(echo "$PATCHED" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read()))')}]" 2>/dev/null && \
+                          echo "K8s CoreDNS configmap patched" || \
+                          echo "WARNING: Failed to patch K8s CoreDNS configmap"
+                      kubectl rollout restart deployment coredns -n kube-system 2>/dev/null || true
+                  else
+                      echo "K8s CoreDNS already configured for external DNS"
+                  fi
+              fi
+
               echo "CoreDNS installation complete on $HOSTNAME"
           fi
 
