@@ -474,9 +474,15 @@ mainSteps:
               # Make immutable to prevent systemd-resolved overwrite
               chattr +i /etc/resolv.conf
 
-              # Create containerd DNS symlink
+              # Create containerd/kubelet DNS symlink (required for pod sandbox creation)
               mkdir -p /run/systemd/resolve
               ln -sf /etc/resolv.conf /run/systemd/resolve/resolv.conf
+
+              # Persist the symlink across reboots (/run is tmpfs)
+              cat > /etc/tmpfiles.d/resolv-symlink.conf << 'TMPFILES'
+          d /run/systemd/resolve 0755 root root -
+          L /run/systemd/resolve/resolv.conf - - - - /etc/resolv.conf
+          TMPFILES
 
               # Restart containerd
               if systemctl is-active --quiet containerd; then
