@@ -103,9 +103,10 @@ mainSteps:
                   sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' | \
                   tee /etc/apt/sources.list.d/nvidia-container-toolkit.list
 
-              # Install NVIDIA driver
+              # Install NVIDIA driver + utils
+              # Ubuntu 24.04 uses nvidia-utils-550-server (not nvidia-utils-550)
               apt-get update
-              apt-get install -y nvidia-driver-550 nvidia-utils-550
+              apt-get install -y nvidia-driver-550 nvidia-utils-550-server
               echo "NVIDIA driver-550 installed"
               echo "NOTE: A reboot may be required for the driver to load"
           else
