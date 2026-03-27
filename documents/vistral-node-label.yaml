@@ -35,6 +35,12 @@ mainSteps:
           HOSTNAME=$(hostname | tr '[:upper:]' '[:lower:]')
           echo "Hostname: $HOSTNAME"
 
+          # Dev nodes are not in the cluster
+          if [[ "$HOSTNAME" =~ ^vausd[0-9]+$ ]]; then
+              echo "Dev node. No cluster to label. Skipping."
+              exit 0
+          fi
+
           # Must be in cluster
           if [ ! -f /etc/kubernetes/kubelet.conf ]; then
               echo "Not in a cluster yet. Skipping."

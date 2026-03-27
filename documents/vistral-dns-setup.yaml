@@ -51,6 +51,12 @@ mainSteps:
           HOSTNAME=$(hostname | tr '[:upper:]' '[:lower:]')
           echo "Hostname: $HOSTNAME"
 
+          # Dev nodes use DHCP DNS, no cluster DNS needed
+          if [[ "$HOSTNAME" =~ ^vausd[0-9]+$ ]]; then
+              echo "Dev node. DNS via DHCP. Skipping."
+              exit 0
+          fi
+
           # Determine role from hostname
           if [[ "$HOSTNAME" =~ ^vausk[0-9]+$ ]]; then
               ROLE="control-plane"

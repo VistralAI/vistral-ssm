@@ -64,6 +64,12 @@ mainSteps:
           HOSTNAME=$(hostname | tr '[:upper:]' '[:lower:]')
           echo "Hostname: $HOSTNAME"
 
+          # Dev nodes do not join the Kubernetes cluster
+          if [[ "$HOSTNAME" =~ ^vausd[0-9]+$ ]]; then
+              echo "Dev node detected. Skipping K8s join."
+              exit 0
+          fi
+
           # Smart guard: detect healthy vs broken node state
           if [ -f /etc/kubernetes/kubelet.conf ]; then
               echo "Found existing kubelet.conf. Checking node health..."

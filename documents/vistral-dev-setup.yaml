@@ -1,0 +1,203 @@
+schemaVersion: "2.2"
+description: |
+  Dev node provisioning: Docker, NVIDIA drivers, Container Toolkit, NFS mounts, dev tools.
+  Only runs on VAUSD hostnames (dev devices). All other node types skip immediately.
+
+  This document runs early in the buildout pipeline (step 2b, after T2 bootstrap)
+  so dev nodes are fully provisioned before K8s steps (which they skip).
+
+  Installs:
+  1. Docker daemon + insecure registry config for NAS (192.168.1.201:9500)
+  2. NVIDIA driver-550 + nvidia-container-toolkit
+  3. NFS client + mounts for models/input/output
+  4. Dev tools (git, build-essential, python3-venv, jq, htop, tmux)
+
+  Guard: Skips if Docker + NVIDIA drivers are already installed and working.
+
+parameters:
+  AWSRegion:
+    type: String
+    description: "AWS region"
+    default: "us-east-1"
+
+mainSteps:
+  - action: aws:runShellScript
+    name: devNodeSetup
+    inputs:
+      timeoutSeconds: 2400
+      runCommand:
+        - |
+          #!/bin/bash
+          set -e
+
+          LOG="/var/log/vistral-dev-setup.log"
+          exec > >(tee -a "$LOG") 2>&1
+
+          echo "=============================================="
+          echo "Vistral Dev Node Setup - $(date)"
+          echo "=============================================="
+
+          HOSTNAME=$(hostname | tr '[:upper:]' '[:lower:]')
+          echo "Hostname: $HOSTNAME"
+
+          # Guard: only run on dev nodes
+          if [[ ! "$HOSTNAME" =~ ^vausd[0-9]+$ ]]; then
+              echo "Not a dev node. Skipping."
+              exit 0
+          fi
+
+          # Guard: skip if already fully provisioned
+          if command -v docker &>/dev/null && command -v nvidia-smi &>/dev/null; then
+              if docker run --rm --gpus all nvidia/cuda:12.8.0-base-ubuntu24.04 nvidia-smi &>/dev/null 2>&1; then
+                  echo "Docker + NVIDIA already configured and working. Skipping."
+                  exit 0
+              fi
+          fi
+
+          echo "Provisioning dev node..."
+
+          # =========================================
+          # Step 1: Install Docker
+          # =========================================
+          echo "--- Step 1: Docker ---"
+          if ! command -v docker &>/dev/null; then
+              apt-get update
+              apt-get install -y docker.io docker-compose
+              systemctl enable docker
+              systemctl start docker
+              usermod -aG docker vadmin
+              echo "Docker installed"
+          else
+              echo "Docker already installed"
+          fi
+
+          # Configure insecure registry for NAS
+          DAEMON_JSON="/etc/docker/daemon.json"
+          if [ ! -f "$DAEMON_JSON" ] || ! grep -q "192.168.1.201:9500" "$DAEMON_JSON" 2>/dev/null; then
+              cat > "$DAEMON_JSON" <<'DOCKER_EOF'
+          {
+              "insecure-registries": ["192.168.1.201:9500"],
+              "log-driver": "json-file",
+              "log-opts": {
+                  "max-size": "100m",
+                  "max-file": "3"
+              }
+          }
+          DOCKER_EOF
+              systemctl restart docker
+              echo "Docker daemon configured with insecure registry"
+          else
+              echo "Docker daemon already configured"
+          fi
+
+          # =========================================
+          # Step 2: Install NVIDIA Driver
+          # =========================================
+          echo "--- Step 2: NVIDIA Driver ---"
+          if ! command -v nvidia-smi &>/dev/null; then
+              # Add NVIDIA package repository
+              apt-get install -y linux-headers-$(uname -r)
+              distribution=$(. /etc/os-release; echo $ID$VERSION_ID)
+              curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+              curl -fsSL "https://nvidia.github.io/libnvidia-container/${distribution}/libnvidia-container.list" | \
+                  sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' | \
+                  tee /etc/apt/sources.list.d/nvidia-container-toolkit.list
+
+              # Install NVIDIA driver
+              apt-get update
+              apt-get install -y nvidia-driver-550 nvidia-utils-550
+              echo "NVIDIA driver-550 installed"
+              echo "NOTE: A reboot may be required for the driver to load"
+          else
+              echo "NVIDIA driver already installed: $(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null || echo 'unknown')"
+          fi
+
+          # =========================================
+          # Step 3: Install NVIDIA Container Toolkit
+          # =========================================
+          echo "--- Step 3: NVIDIA Container Toolkit ---"
+          if ! command -v nvidia-ctk &>/dev/null; then
+              apt-get install -y nvidia-container-toolkit
+              nvidia-ctk runtime configure --runtime=docker
+              systemctl restart docker
+              echo "NVIDIA Container Toolkit installed and configured for Docker"
+          else
+              echo "NVIDIA Container Toolkit already installed"
+          fi
+
+          # =========================================
+          # Step 4: Mount NFS Volumes
+          # =========================================
+          echo "--- Step 4: NFS Mounts ---"
+          if ! command -v mount.nfs &>/dev/null; then
+              apt-get install -y nfs-common
+          fi
+
+          NAS_IP="192.168.1.201"
+          NFS_BASE="/volume1/vistral-share/Vistral/K8Storage"
+
+          # Create mount points
+          mkdir -p /mnt/nfs/deepstream/models
+          mkdir -p /mnt/nfs/deepstream/input
+          mkdir -p /mnt/nfs/deepstream/output
+
+          # Add fstab entries if not already present
+          add_nfs_mount() {
+              local remote_path="$1"
+              local local_path="$2"
+              if ! grep -q "$local_path" /etc/fstab 2>/dev/null; then
+                  echo "${NAS_IP}:${remote_path} ${local_path} nfs defaults,_netdev,soft,timeo=150,retrans=3 0 0" >> /etc/fstab
+                  echo "Added fstab entry: ${remote_path} -> ${local_path}"
+              fi
+          }
+
+          add_nfs_mount "${NFS_BASE}/deepstream/models" "/mnt/nfs/deepstream/models"
+          add_nfs_mount "${NFS_BASE}/deepstream/input" "/mnt/nfs/deepstream/input"
+          add_nfs_mount "${NFS_BASE}/deepstream/output" "/mnt/nfs/deepstream/output"
+
+          mount -a 2>/dev/null || echo "WARNING: Some NFS mounts may have failed (NAS may not be reachable yet)"
+
+          # =========================================
+          # Step 5: Install Dev Tools
+          # =========================================
+          echo "--- Step 5: Dev Tools ---"
+          apt-get install -y \
+              git \
+              build-essential \
+              python3-venv \
+              jq \
+              htop \
+              tmux \
+              2>/dev/null || echo "WARNING: Some dev tool packages may have failed"
+
+          echo "Dev tools installed"
+
+          # =========================================
+          # Step 6: Verify
+          # =========================================
+          echo "--- Step 6: Verification ---"
+          echo "Docker: $(docker --version 2>/dev/null || echo 'NOT INSTALLED')"
+          echo "NVIDIA Driver: $(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null || echo 'NOT LOADED (reboot may be needed)')"
+          echo "NVIDIA CTK: $(nvidia-ctk --version 2>/dev/null || echo 'NOT INSTALLED')"
+          echo "NFS mounts:"
+          mount | grep nfs || echo "  No NFS mounts active (NAS may not be reachable)"
+
+          # Test Docker + GPU integration (only if driver is loaded)
+          if command -v nvidia-smi &>/dev/null && nvidia-smi &>/dev/null; then
+              echo ""
+              echo "Testing Docker + GPU..."
+              if docker run --rm --gpus all nvidia/cuda:12.8.0-base-ubuntu24.04 nvidia-smi; then
+                  echo "SUCCESS: Docker + GPU working"
+              else
+                  echo "WARNING: Docker + GPU test failed (may need reboot for driver)"
+              fi
+          else
+              echo ""
+              echo "NVIDIA driver not yet loaded. Reboot required to complete GPU setup."
+              echo "After reboot, verify with: docker run --rm --gpus all nvidia/cuda:12.8.0-base-ubuntu24.04 nvidia-smi"
+          fi
+
+          echo ""
+          echo "=============================================="
+          echo "Dev node setup complete - $(date)"
+          echo "=============================================="

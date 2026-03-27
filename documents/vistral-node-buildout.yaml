@@ -6,8 +6,10 @@ description: |
   Execution order:
   1. T2 Bootstrap — detect Apple hardware, install T2 kernel (continues on failure for non-Apple)
   2. Wait for potential reboot
+  2b. Dev Setup — Docker, NVIDIA drivers, NFS, dev tools for VAUSD nodes (skips on all other nodes)
   3. K8s Join — join cluster based on hostname role (aborts on failure, retries once)
      Also auto-resets stale/broken nodes (expired certs, dead kubelet) before rejoining
+     Dev nodes (VAUSD) skip this step.
   4. Node Label — apply labels and taints based on hardware/role (continues on failure)
   5. GPU Setup — install GPU Operator, configure time-slicing (continues on failure, not all nodes have GPUs)
   6. DNS Setup — install CoreDNS on CPs, configure worker DNS (continues on failure)
@@ -78,6 +80,20 @@ mainSteps:
     action: aws:sleep
     inputs:
       Duration: PT90S
+
+  # Step 2b: Dev node setup (Docker, GPU drivers, NFS, dev tools)
+  # Only runs on VAUSD hostnames — guard inside document skips all other node types
+  - name: devSetup
+    action: aws:runCommand
+    onFailure: Continue
+    timeoutSeconds: 2400
+    inputs:
+      DocumentName: vistral-dev-setup
+      InstanceIds:
+        - "{{InstanceId}}"
+      CloudWatchOutputConfig:
+        CloudWatchLogGroupName: /aws/ssm/vistral-buildout
+        CloudWatchOutputEnabled: true
 
   # Step 3: Join Kubernetes cluster (or auto-reset + rejoin if stale)
   - name: k8sJoin
