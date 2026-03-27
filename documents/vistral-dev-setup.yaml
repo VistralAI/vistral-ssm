@@ -46,10 +46,16 @@ mainSteps:
               exit 0
           fi
 
-          # Guard: skip if already fully provisioned
-          if command -v docker &>/dev/null && command -v nvidia-smi &>/dev/null; then
+          # Guard: skip if ALL components are already provisioned
+          # Must check every install step, not just Docker + GPU
+          FULLY_PROVISIONED=true
+          command -v docker &>/dev/null || FULLY_PROVISIONED=false
+          command -v nvidia-smi &>/dev/null || FULLY_PROVISIONED=false
+          command -v nvidia-ctk &>/dev/null || FULLY_PROVISIONED=false
+          mount | grep -q nfs || FULLY_PROVISIONED=false
+          if [ "$FULLY_PROVISIONED" = "true" ]; then
               if docker run --rm --gpus all nvidia/cuda:12.8.0-base-ubuntu24.04 nvidia-smi &>/dev/null 2>&1; then
-                  echo "Docker + NVIDIA already configured and working. Skipping."
+                  echo "All components already configured and working. Skipping."
                   exit 0
               fi
           fi
