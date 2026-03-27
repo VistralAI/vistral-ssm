@@ -7,7 +7,8 @@ description: |
   1. T2 Bootstrap — detect Apple hardware, install T2 kernel (continues on failure for non-Apple)
   2. Wait for potential reboot
   2b. Dev Setup — Docker, NVIDIA drivers, NFS, dev tools for VAUSD nodes (skips on all other nodes)
-  2c. Wait 120s — for dev node reboot after NVIDIA driver install
+  2c. Check role tag — branch on k8s-role=dev
+  2d. Wait 120s — only for dev nodes (NVIDIA driver reboot), skipped for all others
   3. K8s Join — join cluster based on hostname role (aborts on failure, retries once)
      Also auto-resets stale/broken nodes (expired certs, dead kubelet) before rejoining
      Dev nodes (VAUSD) skip this step.
@@ -97,8 +98,32 @@ mainSteps:
         CloudWatchLogGroupName: /aws/ssm/vistral-buildout
         CloudWatchOutputEnabled: true
 
-  # Step 2c: Wait for dev node reboot (NVIDIA driver needs kernel module load)
-  # 120 seconds — harmless for non-dev nodes (devSetup exits instantly, no reboot)
+  # Step 2c: Check if dev node needs reboot wait
+  # Reads k8s-role tag to determine if this is a dev node
+  - name: checkDevRole
+    action: aws:executeAwsApi
+    onFailure: Continue
+    inputs:
+      Service: ssm
+      Api: ListTagsForResource
+      ResourceType: ManagedInstance
+      ResourceId: "{{InstanceId}}"
+    outputs:
+      - Name: k8sRole
+        Selector: "$.TagList[?(@.Key=='k8s-role')].Value"
+        Type: String
+
+  # Step 2d: Branch — wait 120s for dev reboot, skip for all others
+  - name: branchOnDevRole
+    action: aws:branch
+    onFailure: Continue
+    inputs:
+      Choices:
+        - NextStep: waitForDevReboot
+          Variable: "{{ checkDevRole.k8sRole }}"
+          StringEquals: dev
+      Default: k8sJoin
+
   - name: waitForDevReboot
     action: aws:sleep
     inputs:
