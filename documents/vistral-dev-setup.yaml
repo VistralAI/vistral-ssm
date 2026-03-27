@@ -171,28 +171,22 @@ mainSteps:
           fi
 
           NAS_IP="192.168.1.201"
-          NFS_BASE="/volume1/vistral-share/Vistral/K8Storage"
+          NFS_SHARE="/volume1/vistral-share"
 
-          # Create mount points
-          mkdir -p /mnt/nfs/deepstream/models
-          mkdir -p /mnt/nfs/deepstream/input
-          mkdir -p /mnt/nfs/deepstream/output
+          # The NAS exports a single share (/volume1/vistral-share).
+          # Mount the root share, then create convenience symlinks for
+          # deepstream paths so containers can mount /mnt/nfs/deepstream/*.
+          mkdir -p /mnt/nfs/vistral-share
 
-          # Add fstab entries if not already present
-          add_nfs_mount() {
-              local remote_path="$1"
-              local local_path="$2"
-              if ! grep -q "$local_path" /etc/fstab 2>/dev/null; then
-                  echo "${NAS_IP}:${remote_path} ${local_path} nfs defaults,_netdev,soft,timeo=150,retrans=3 0 0" >> /etc/fstab
-                  echo "Added fstab entry: ${remote_path} -> ${local_path}"
-              fi
-          }
+          if ! grep -q "/mnt/nfs/vistral-share" /etc/fstab 2>/dev/null; then
+              echo "${NAS_IP}:${NFS_SHARE} /mnt/nfs/vistral-share nfs defaults,_netdev,soft,timeo=150,retrans=3 0 0" >> /etc/fstab
+              echo "Added fstab entry: ${NFS_SHARE} -> /mnt/nfs/vistral-share"
+          fi
 
-          add_nfs_mount "${NFS_BASE}/deepstream/models" "/mnt/nfs/deepstream/models"
-          add_nfs_mount "${NFS_BASE}/deepstream/input" "/mnt/nfs/deepstream/input"
-          add_nfs_mount "${NFS_BASE}/deepstream/output" "/mnt/nfs/deepstream/output"
+          mount -a 2>/dev/null || echo "WARNING: NFS mount may have failed (NAS may not be reachable yet)"
 
-          mount -a 2>/dev/null || echo "WARNING: Some NFS mounts may have failed (NAS may not be reachable yet)"
+          # Create convenience symlink for deepstream paths
+          ln -sfn /mnt/nfs/vistral-share/Vistral/K8Storage/deepstream /mnt/nfs/deepstream
 
           # =========================================
           # Step 5: Install Dev Tools
