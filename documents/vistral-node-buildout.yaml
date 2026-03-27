@@ -7,6 +7,7 @@ description: |
   1. T2 Bootstrap — detect Apple hardware, install T2 kernel (continues on failure for non-Apple)
   2. Wait for potential reboot
   2b. Dev Setup — Docker, NVIDIA drivers, NFS, dev tools for VAUSD nodes (skips on all other nodes)
+  2c. Wait 120s — for dev node reboot after NVIDIA driver install
   3. K8s Join — join cluster based on hostname role (aborts on failure, retries once)
      Also auto-resets stale/broken nodes (expired certs, dead kubelet) before rejoining
      Dev nodes (VAUSD) skip this step.
@@ -83,6 +84,7 @@ mainSteps:
 
   # Step 2b: Dev node setup (Docker, GPU drivers, NFS, dev tools)
   # Only runs on VAUSD hostnames — guard inside document skips all other node types
+  # Reboots at end to load NVIDIA kernel module (skips instantly on non-dev nodes)
   - name: devSetup
     action: aws:runCommand
     onFailure: Continue
@@ -94,6 +96,13 @@ mainSteps:
       CloudWatchOutputConfig:
         CloudWatchLogGroupName: /aws/ssm/vistral-buildout
         CloudWatchOutputEnabled: true
+
+  # Step 2c: Wait for dev node reboot (NVIDIA driver needs kernel module load)
+  # 120 seconds — harmless for non-dev nodes (devSetup exits instantly, no reboot)
+  - name: waitForDevReboot
+    action: aws:sleep
+    inputs:
+      Duration: PT120S
 
   # Step 3: Join Kubernetes cluster (or auto-reset + rejoin if stale)
   - name: k8sJoin

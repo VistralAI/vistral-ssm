@@ -182,22 +182,17 @@ mainSteps:
           echo "NFS mounts:"
           mount | grep nfs || echo "  No NFS mounts active (NAS may not be reachable)"
 
-          # Test Docker + GPU integration (only if driver is loaded)
-          if command -v nvidia-smi &>/dev/null && nvidia-smi &>/dev/null; then
-              echo ""
-              echo "Testing Docker + GPU..."
-              if docker run --rm --gpus all nvidia/cuda:12.8.0-base-ubuntu24.04 nvidia-smi; then
-                  echo "SUCCESS: Docker + GPU working"
-              else
-                  echo "WARNING: Docker + GPU test failed (may need reboot for driver)"
-              fi
-          else
-              echo ""
-              echo "NVIDIA driver not yet loaded. Reboot required to complete GPU setup."
-              echo "After reboot, verify with: docker run --rm --gpus all nvidia/cuda:12.8.0-base-ubuntu24.04 nvidia-smi"
-          fi
-
-          echo ""
+          # =========================================
+          # Step 6: Reboot to load NVIDIA kernel module
+          # =========================================
+          # NVIDIA driver requires a reboot to load the kernel module.
+          # The buildout orchestrator has a 120s wait after this step,
+          # then the next cycle will re-run — the idempotent guard at
+          # the top will verify Docker + GPU and skip if working.
+          echo "--- Step 6: Reboot ---"
+          echo "NVIDIA driver installed. Rebooting to load kernel module..."
           echo "=============================================="
-          echo "Dev node setup complete - $(date)"
+          echo "Dev node setup complete (pre-reboot) - $(date)"
           echo "=============================================="
+          reboot
+          exit 0
