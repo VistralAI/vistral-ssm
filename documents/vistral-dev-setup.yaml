@@ -123,6 +123,20 @@ mainSteps:
               apt-get install -y nvidia-driver-550=550.* nvidia-utils-550=550.* \
                   nvidia-dkms-550=550.* 2>/dev/null || \
               apt-get install -y cuda-drivers-550
+
+              # Explicitly build and install DKMS kernel module
+              # apt post-install hooks may not complete if interrupted (power failure, timeout).
+              # This ensures the module is compiled and installed before we reboot.
+              KERNEL_VER=$(uname -r)
+              DKMS_STATUS=$(dkms status nvidia/550.163.01 -k "$KERNEL_VER" 2>/dev/null || echo "")
+              if echo "$DKMS_STATUS" | grep -q "installed"; then
+                  echo "DKMS module already installed for kernel $KERNEL_VER"
+              else
+                  echo "Building DKMS module for kernel $KERNEL_VER..."
+                  dkms build nvidia/550.163.01 -k "$KERNEL_VER" 2>&1 || echo "WARNING: dkms build failed"
+                  dkms install nvidia/550.163.01 -k "$KERNEL_VER" 2>&1 || echo "WARNING: dkms install failed"
+              fi
+
               echo "NVIDIA R550 driver installed from CUDA repo"
               echo "NOTE: A reboot is required to load the kernel module"
           else
