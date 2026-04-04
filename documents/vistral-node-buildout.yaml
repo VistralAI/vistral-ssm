@@ -33,7 +33,7 @@ parameters:
     default: "vistral-github-deploy-key"
   PlatformDeployKeySecretName:
     type: String
-    description: "AWS Secrets Manager secret for vistral-platform-v3 repo"
+    description: "AWS Secrets Manager secret for vistral-stack repo"
     default: "vistral-github-deploy-key-platform"
   JoinTokenSecretName:
     type: String
@@ -49,8 +49,8 @@ parameters:
     default: "git@github.com:VistralAI/vistral-cluster.git"
   PlatformRepo:
     type: String
-    description: "GitHub repository URL for vistral-platform-v3 (SSH format)"
-    default: "git@github.com:VistralAI/vistral-platform-v3.git"
+    description: "GitHub repository URL for vistral-stack (SSH format)"
+    default: "git@github.com:VistralAI/vistral-stack.git"
   AWSRegion:
     type: String
     description: "AWS region"

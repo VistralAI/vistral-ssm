@@ -1,10 +1,10 @@
 schemaVersion: "2.2"
 description: |
-  Deploy vistral-platform-v3 Helm chart and bootstrap ArgoCD.
+  Deploy vistral-stack Helm chart and bootstrap ArgoCD.
   Runs on the primary control plane after the cluster is fully formed.
 
   This document:
-  1. Clones vistral-platform-v3 from GitHub
+  1. Clones vistral-stack from GitHub
   2. Builds Helm dependencies
   3. Installs the platform chart (or upgrades if already installed)
   4. Bootstraps ArgoCD
@@ -18,8 +18,8 @@ parameters:
     default: "vistral-github-deploy-key-platform"
   PlatformRepo:
     type: String
-    description: "GitHub repository URL for vistral-platform-v3 (SSH format)"
-    default: "git@github.com:VistralAI/vistral-platform-v3.git"
+    description: "GitHub repository URL for vistral-stack (SSH format)"
+    default: "git@github.com:VistralAI/vistral-stack.git"
   AWSRegion:
     type: String
     description: "AWS region"
@@ -50,7 +50,7 @@ mainSteps:
           AWS_REGION="{{AWSRegion}}"
           NAMESPACE="{{Namespace}}"
           VALUES_OVERRIDE="{{ValuesOverride}}"
-          CHART_DIR="/opt/vistral-platform-v3"
+          CHART_DIR="/opt/vistral-stack"
           HELM_MANAGED_NAMESPACES="cvat automation video-processing"
 
           LOG="/var/log/vistral-platform-deploy.log"
@@ -187,7 +187,7 @@ mainSteps:
           ssh-keyscan github.com >> ~/.ssh/known_hosts 2>/dev/null
           export GIT_SSH_COMMAND="ssh -i ~/.ssh/github_deploy -o StrictHostKeyChecking=no"
 
-          echo "Cloning vistral-platform-v3..."
+          echo "Cloning vistral-stack..."
           rm -rf "$CHART_DIR"
           git clone "$PLATFORM_REPO" "$CHART_DIR" || {
               echo "ERROR: Failed to clone platform repo"
