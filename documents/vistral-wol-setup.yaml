@@ -1,0 +1,140 @@
+schemaVersion: "2.2"
+description: |
+  Enable Wake-on-LAN (WOL) on GPU worker nodes for use with vistral-powernap.
+
+  This document:
+  1. Installs ethtool if missing
+  2. Enables WOL on the primary network interface (eth0)
+  3. Creates a systemd oneshot service to persist WOL across reboots
+  4. Annotates the Kubernetes node with its MAC address for WOL discovery
+
+  Run on: GPU worker nodes (vausw*)
+  Prerequisite: Node must already be joined to the cluster with kubectl access.
+  Idempotent: Safe to run multiple times.
+
+parameters:
+  NetworkInterface:
+    type: String
+    description: "Network interface to enable WOL on"
+    default: "eth0"
+  AWSRegion:
+    type: String
+    description: "AWS region for Secrets Manager"
+    default: "us-east-1"
+
+mainSteps:
+  - action: aws:runShellScript
+    name: enableWakeOnLan
+    inputs:
+      timeoutSeconds: 300
+      runCommand:
+        - |
+          #!/bin/bash
+          set -e
+
+          IFACE="{{NetworkInterface}}"
+          LOG="/var/log/vistral-wol-setup.log"
+          exec > >(tee -a "$LOG") 2>&1
+
+          echo "=============================================="
+          echo "WOL Setup — $(date)"
+          echo "=============================================="
+          echo "Interface: $IFACE"
+
+          HOSTNAME=$(hostname | tr '[:upper:]' '[:lower:]')
+
+          # -----------------------------------------------
+          # Step 1: Install ethtool if missing
+          # -----------------------------------------------
+          if ! command -v ethtool &>/dev/null; then
+            echo "Installing ethtool..."
+            if command -v apt-get &>/dev/null; then
+              apt-get update -qq && apt-get install -y -qq ethtool
+            elif command -v yum &>/dev/null; then
+              yum install -y ethtool
+            else
+              echo "ERROR: Cannot install ethtool — no supported package manager"
+              exit 1
+            fi
+          else
+            echo "ethtool already installed"
+          fi
+
+          # -----------------------------------------------
+          # Step 2: Enable WOL on the interface
+          # -----------------------------------------------
+          echo "Enabling WOL on $IFACE..."
+          ethtool -s "$IFACE" wol g
+
+          # Verify
+          WOL_STATUS=$(ethtool "$IFACE" | grep "Wake-on:" | tail -1 | awk '{print $2}')
+          if [[ "$WOL_STATUS" == *"g"* ]]; then
+            echo "WOL enabled successfully (Wake-on: $WOL_STATUS)"
+          else
+            echo "WARNING: WOL may not be enabled (Wake-on: $WOL_STATUS)"
+            echo "Check BIOS/UEFI settings — WOL must be enabled in firmware first"
+          fi
+
+          # -----------------------------------------------
+          # Step 3: Persist WOL via systemd service
+          # -----------------------------------------------
+          SERVICE_FILE="/etc/systemd/system/wol-enable.service"
+          echo "Creating systemd service at $SERVICE_FILE..."
+
+          cat > "$SERVICE_FILE" << UNIT
+          [Unit]
+          Description=Enable Wake-on-LAN on $IFACE
+          After=network-online.target
+          Wants=network-online.target
+
+          [Service]
+          Type=oneshot
+          ExecStart=/usr/sbin/ethtool -s $IFACE wol g
+          RemainAfterExit=yes
+
+          [Install]
+          WantedBy=multi-user.target
+          UNIT
+
+          systemctl daemon-reload
+          systemctl enable wol-enable.service
+          echo "WOL persistence service enabled"
+
+          # -----------------------------------------------
+          # Step 4: Annotate Kubernetes node with MAC address
+          # -----------------------------------------------
+          MAC_ADDR=$(cat "/sys/class/net/$IFACE/address" 2>/dev/null || ip link show "$IFACE" | grep link/ether | awk '{print $2}')
+
+          if [[ -z "$MAC_ADDR" ]]; then
+            echo "ERROR: Could not determine MAC address for $IFACE"
+            exit 1
+          fi
+
+          echo "MAC address: $MAC_ADDR"
+
+          # Try to annotate — requires kubectl and kubeconfig
+          if command -v kubectl &>/dev/null; then
+            # Try admin config (control plane) or kubelet config (worker)
+            if [[ -f /etc/kubernetes/admin.conf ]]; then
+              export KUBECONFIG=/etc/kubernetes/admin.conf
+            elif [[ -f /etc/kubernetes/kubelet.conf ]]; then
+              export KUBECONFIG=/etc/kubernetes/kubelet.conf
+            fi
+
+            if kubectl annotate node "$HOSTNAME" \
+              "vistral.ai/wol-mac=$MAC_ADDR" \
+              --overwrite 2>/dev/null; then
+              echo "Node annotated: vistral.ai/wol-mac=$MAC_ADDR"
+            else
+              echo "WARNING: Could not annotate node $HOSTNAME"
+              echo "Run manually from control plane:"
+              echo "  kubectl annotate node $HOSTNAME vistral.ai/wol-mac=$MAC_ADDR"
+            fi
+          else
+            echo "kubectl not found — annotate manually from control plane:"
+            echo "  kubectl annotate node $HOSTNAME vistral.ai/wol-mac=$MAC_ADDR"
+          fi
+
+          echo "=============================================="
+          echo "WOL setup complete for $HOSTNAME"
+          echo "=============================================="
