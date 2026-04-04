@@ -35,6 +35,13 @@ mainSteps:
           echo "T2 Hardware Bootstrap - $(date)"
           echo "=============================================="
 
+          # Extend LVM to use all available disk space (prevents out-of-disk during buildout)
+          echo "Extending LVM to use all free space..."
+          lvextend -l +100%FREE /dev/mapper/ubuntu--vg-ubuntu--lv 2>/dev/null && \
+              resize2fs /dev/mapper/ubuntu--vg-ubuntu--lv 2>/dev/null && \
+              echo "LVM extended successfully." || \
+              echo "LVM extend skipped (no free space or not an LVM setup)."
+
           # Guard: skip if T2 kernel already installed
           if dpkg -l | grep -q "linux-t2-lts"; then
               echo "T2 kernel already installed. Skipping."

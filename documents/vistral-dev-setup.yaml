@@ -188,6 +188,47 @@ mainSteps:
           # Create convenience symlink for deepstream paths
           ln -sfn /mnt/nfs/vistral-share/Vistral/K8Storage/deepstream /mnt/nfs/deepstream
 
+          # Install systemd automount so NFS mounts on first access after reboot,
+          # even if the NAS is slow to come up (common with consumer Synology).
+          # _netdev alone is not sufficient — if the NAS isn't reachable during
+          # boot, mount -a fails silently and the share stays unmounted.
+          # Automount defers the actual mount until something accesses the path.
+          UNIT_NAME="mnt-nfs-vistral\\x2dshare"
+
+          printf '%s\n' \
+            "[Unit]" \
+            "Description=Automount NFS vistral-share on first access" \
+            "ConditionPathExists=/mnt/nfs/vistral-share" \
+            "" \
+            "[Automount]" \
+            "Where=/mnt/nfs/vistral-share" \
+            "TimeoutIdleSec=0" \
+            "" \
+            "[Install]" \
+            "WantedBy=multi-user.target" \
+            > "/etc/systemd/system/${UNIT_NAME}.automount"
+
+          printf '%s\n' \
+            "[Unit]" \
+            "Description=NFS mount for vistral-share (192.168.1.201)" \
+            "After=network-online.target" \
+            "Wants=network-online.target" \
+            "" \
+            "[Mount]" \
+            "What=192.168.1.201:/volume1/vistral-share" \
+            "Where=/mnt/nfs/vistral-share" \
+            "Type=nfs" \
+            "Options=defaults,_netdev,soft,timeo=150,retrans=3" \
+            "TimeoutSec=30" \
+            "" \
+            "[Install]" \
+            "WantedBy=multi-user.target" \
+            > "/etc/systemd/system/${UNIT_NAME}.mount"
+
+          systemctl daemon-reload
+          systemctl enable "${UNIT_NAME}.automount"
+          echo "Systemd automount unit installed — NFS will mount on first access after reboot"
+
           # =========================================
           # Step 5: Install Dev Tools
           # =========================================
