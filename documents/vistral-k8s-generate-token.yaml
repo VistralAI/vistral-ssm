@@ -38,6 +38,8 @@ mainSteps:
           AWS_REGION="{{AWSRegion}}"
           TOKEN_TTL="{{TokenTTL}}"
 
+          export KUBECONFIG=/etc/kubernetes/admin.conf
+
           # Logging
           LOG="/var/log/k8s-token-generation.log"
           exec > >(tee -a "$LOG") 2>&1
