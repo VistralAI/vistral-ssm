@@ -157,6 +157,15 @@ mainSteps:
               echo "Partial init cleaned up."
           fi
 
+          # Detect stale manifests from a previous failed join attempt
+          if [ -f /etc/kubernetes/manifests/kube-apiserver.yaml ] && ! systemctl is-active --quiet kubelet; then
+              echo "Detected stale manifests from previous failed join. Resetting..."
+              kubeadm reset -f 2>/dev/null || true
+              rm -rf /etc/kubernetes/ /var/lib/kubelet/ /var/lib/etcd/ /etc/cni/net.d/ $HOME/.kube/
+              systemctl restart containerd 2>/dev/null || true
+              echo "Stale manifests cleaned up."
+          fi
+
           # Determine role from hostname
           if [[ "$HOSTNAME" =~ ^vausk[0-9]+$ ]]; then
               ROLE="control-plane"
