@@ -436,10 +436,31 @@ mainSteps:
 
                       echo "Stale node $HOSTNAME removed from cluster"
 
-                      # For control planes, etcd cleanup happens automatically via kubeadm join
-                      # kubeadm will detect the orphaned member and handle it
+                      # For control planes, remove the stale etcd member so kubeadm join
+                      # doesn't time out trying to reach a dead peer
                       if [ "$ROLE" = "control-plane" ]; then
-                          echo "Note: etcd member cleanup will be handled by kubeadm during join"
+                          echo "Removing stale etcd member for $HOSTNAME..."
+                          # Find a healthy etcd endpoint on another CP
+                          ETCD_ENDPOINT=""
+                          for cp_ip in $(KUBECONFIG="$TEMP_KUBECONFIG" kubectl get nodes -l node-role.kubernetes.io/control-plane -o jsonpath='{.items[*].status.addresses[?(@.type=="InternalIP")].address}' 2>/dev/null); do
+                              if [ "$cp_ip" != "$(hostname -I | awk '{print $1}')" ]; then
+                                  ETCD_ENDPOINT="https://$cp_ip:2379"
+                                  break
+                              fi
+                          done
+                          if [ -n "$ETCD_ENDPOINT" ]; then
+                              # Get this node's etcd member ID and remove it
+                              MY_IP=$(hostname -I | awk '{print $1}')
+                              MEMBER_ID=$(KUBECONFIG="$TEMP_KUBECONFIG" kubectl exec -n kube-system etcd-$(KUBECONFIG="$TEMP_KUBECONFIG" kubectl get nodes -l node-role.kubernetes.io/control-plane -o jsonpath='{.items[0].metadata.name}' 2>/dev/null) -- etcdctl --endpoints=https://127.0.0.1:2379 --cert=/etc/kubernetes/pki/etcd/server.crt --key=/etc/kubernetes/pki/etcd/server.key --cacert=/etc/kubernetes/pki/etcd/ca.crt member list 2>/dev/null | grep "$MY_IP" | cut -d',' -f1 | tr -d ' ')
+                              if [ -n "$MEMBER_ID" ]; then
+                                  echo "  Removing etcd member $MEMBER_ID ($MY_IP)..."
+                                  KUBECONFIG="$TEMP_KUBECONFIG" kubectl exec -n kube-system etcd-$(KUBECONFIG="$TEMP_KUBECONFIG" kubectl get nodes -l node-role.kubernetes.io/control-plane -o jsonpath='{.items[0].metadata.name}' 2>/dev/null) -- etcdctl --endpoints=https://127.0.0.1:2379 --cert=/etc/kubernetes/pki/etcd/server.crt --key=/etc/kubernetes/pki/etcd/server.key --cacert=/etc/kubernetes/pki/etcd/ca.crt member remove "$MEMBER_ID" 2>/dev/null && echo "  etcd member removed" || echo "  WARNING: Could not remove etcd member"
+                              else
+                                  echo "  No stale etcd member found for $MY_IP"
+                              fi
+                          else
+                              echo "  WARNING: Could not find healthy etcd endpoint for member cleanup"
+                          fi
                       fi
 
                       # Wait for cleanup to propagate
