@@ -336,7 +336,8 @@ mainSteps:
                   }
               fi
 
-              # Wait for token to be generated
+              # Wait for a FRESH token (generated after our request)
+              local REQUEST_EPOCH=$(date +%s)
               echo "Waiting for token generation (up to 5 minutes)..." >&2
               for i in {1..30}; do
                   sleep 10
@@ -353,9 +354,14 @@ mainSteps:
                       fi
                       local GENERATED_AT=$(echo "$TOKEN_JSON" | jq -r '.generatedAt // empty')
                       if [ -n "$GENERATED_AT" ]; then
-                          echo "Join token received (generated: $GENERATED_AT)" >&2
-                          echo "$TOKEN_JSON"
-                          return 0
+                          local GEN_EPOCH=$(date -d "$GENERATED_AT" +%s 2>/dev/null || echo "0")
+                          if [ "$GEN_EPOCH" -ge "$REQUEST_EPOCH" ]; then
+                              echo "Join token received (generated: $GENERATED_AT)" >&2
+                              echo "$TOKEN_JSON"
+                              return 0
+                          else
+                              echo "  Token still stale (generated: $GENERATED_AT), waiting..." >&2
+                          fi
                       fi
                   fi
                   echo "  Waiting... ($((i*10))s)" >&2
@@ -368,15 +374,16 @@ mainSteps:
           # Run prerequisites scripts
           run_prerequisites() {
               echo "Running prerequisite scripts..."
+              cd /opt/vistral-cluster
 
               echo "  -> prerequisites.sh"
-              sudo ./scripts/prerequisites.sh
+              sudo bash scripts/prerequisites.sh
 
               echo "  -> container-runtime.sh"
-              sudo ./scripts/container-runtime.sh
+              sudo bash scripts/container-runtime.sh
 
               echo "  -> kubernetes.sh"
-              sudo ./scripts/kubernetes.sh
+              sudo bash scripts/kubernetes.sh
           }
 
           # Function to cleanup stale node from previous installation
