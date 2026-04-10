@@ -55,7 +55,7 @@ mainSteps:
               echo "GPU Operator already running. Skipping installation."
 
               # Still check time-slicing config
-              if kubectl get configmap -n gpu-operator gpu-sharing-config &>/dev/null; then
+              if kubectl get configmap -n gpu-operator gpu-time-slicing-config &>/dev/null; then
                   echo "Time-slicing config already exists."
                   exit 0
               fi
@@ -109,7 +109,7 @@ mainSteps:
           apiVersion: v1
           kind: ConfigMap
           metadata:
-            name: gpu-sharing-config
+            name: gpu-time-slicing-config
             namespace: gpu-operator
           data:
             any: |-
@@ -129,7 +129,7 @@ mainSteps:
           kubectl patch clusterpolicy/cluster-policy \
               -n gpu-operator \
               --type merge \
-              -p '{"spec":{"devicePlugin":{"config":{"name":"gpu-sharing-config","default":"any"}}}}' \
+              -p '{"spec":{"devicePlugin":{"config":{"name":"gpu-time-slicing-config","default":"any"}}}}' \
               2>/dev/null || echo "ClusterPolicy patch skipped (may need manual config)"
 
           echo "Waiting for GPU device plugin to restart..."

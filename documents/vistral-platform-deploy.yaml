@@ -303,6 +303,38 @@ mainSteps:
           kubectl delete validatingwebhookconfiguration ingress-nginx-admission --ignore-not-found 2>/dev/null || true
           kubectl delete mutatingwebhookconfiguration ingress-nginx-admission --ignore-not-found 2>/dev/null || true
 
+          # Adopt orphaned namespaces that exist without Helm ownership labels.
+          # These block helm install because Helm refuses to adopt unlabeled resources.
+          echo "Adopting orphaned namespaces for Helm..."
+          for ns in external-secrets "$NAMESPACE"; do
+              if kubectl get namespace "$ns" &>/dev/null; then
+                  HAS_MANAGED=$(kubectl get namespace "$ns" -o jsonpath='{.metadata.labels.app\.kubernetes\.io/managed-by}' 2>/dev/null)
+                  if [ "$HAS_MANAGED" != "Helm" ]; then
+                      echo "  Labeling namespace $ns for Helm adoption"
+                      kubectl label namespace "$ns" app.kubernetes.io/managed-by=Helm --overwrite 2>/dev/null || true
+                      kubectl annotate namespace "$ns" \
+                          meta.helm.sh/release-name=vistral-platform \
+                          meta.helm.sh/release-namespace="$NAMESPACE" --overwrite 2>/dev/null || true
+                  fi
+              fi
+          done
+
+          # Clean orphaned cluster-scoped resources from previous failed installs.
+          # These have stale Helm ownership labels pointing to a deleted release.
+          echo "Cleaning orphaned cluster-scoped resources..."
+          if ! helm status vistral-platform -n "$NAMESPACE" &>/dev/null; then
+              for resource_type in clusterrole clusterrolebinding; do
+                  kubectl get "$resource_type" \
+                      -l app.kubernetes.io/managed-by=Helm \
+                      -o jsonpath='{range .items[?(@.metadata.annotations.meta\.helm\.sh/release-name=="vistral-platform")]}{.metadata.name}{"\n"}{end}' \
+                      2>/dev/null | while read -r name; do
+                      [ -z "$name" ] && continue
+                      echo "  Deleting orphaned $resource_type/$name"
+                      kubectl delete "$resource_type" "$name" --ignore-not-found 2>/dev/null || true
+                  done
+              done
+          fi
+
           # Force-clean any terminating namespaces from previous failed runs
           force_clean_namespaces
 
@@ -341,6 +373,30 @@ mainSteps:
                   sleep 5
               done
           done
+
+          # Wait for ESO webhook to be ready before Phase 2 creates ExternalSecret CRs.
+          # The webhook validates all ExternalSecret/ClusterSecretStore resources —
+          # if it's not ready, Phase 2 fails with "connection refused".
+          echo "Waiting for External Secrets webhook..."
+          for attempt in $(seq 1 60); do
+              if kubectl get pods -n "$NAMESPACE" -l app.kubernetes.io/name=external-secrets-webhook \
+                  --no-headers 2>/dev/null | grep -q "1/1"; then
+                  echo "  ESO webhook pod ready"
+                  sleep 5
+                  break
+              fi
+              if [ "$attempt" -eq 60 ]; then
+                  echo "  WARNING: ESO webhook not ready after 120s, continuing anyway"
+              fi
+              sleep 2
+          done
+
+          # Delete stale ESO webhook configs — cert controller will recreate them
+          # once the webhook TLS certs are fully initialized
+          echo "Cleaning stale ESO webhook configs..."
+          kubectl delete validatingwebhookconfiguration \
+              externalsecret-validate secretstore-validate \
+              --ignore-not-found 2>/dev/null || true
 
           # =========================================================
           # Phase 2: Full deploy with custom resources enabled
