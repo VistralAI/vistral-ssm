@@ -186,7 +186,7 @@ mainSteps:
           mount -a 2>/dev/null || echo "WARNING: NFS mount may have failed (NAS may not be reachable yet)"
 
           # Create convenience symlink for deepstream paths
-          ln -sfn /mnt/nfs/vistral-share/Vistral/K8Storage/deepstream /mnt/nfs/deepstream
+          ln -sfn /mnt/nfs/vistral-share/Vistral/vision-ai/deepstream /mnt/nfs/deepstream
 
           # Install systemd automount so NFS mounts on first access after reboot,
           # even if the NAS is slow to come up (common with consumer Synology).
