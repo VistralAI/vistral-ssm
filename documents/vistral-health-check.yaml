@@ -96,10 +96,13 @@ mainSteps:
               ((FAIL++))
           fi
 
-          # CoreDNS (control plane only)
-          if systemctl is-active --quiet coredns@primary.service 2>/dev/null; then
-              check "CoreDNS running" systemctl is-active --quiet coredns@primary.service
-              check "CoreDNS health endpoint" curl -sf http://localhost:8080/health
+          # DNS resolution (Cloudflare)
+          if nslookup cvat.vistral.dev 1.1.1.1 &>/dev/null; then
+              echo "  [PASS] Cloudflare DNS (cvat.vistral.dev)"
+              ((PASS++))
+          else
+              echo "  [WARN] Cloudflare DNS resolution failed for cvat.vistral.dev"
+              ((WARN++))
           fi
 
           # GPU (if present)
