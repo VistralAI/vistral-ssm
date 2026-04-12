@@ -79,7 +79,7 @@ mainSteps:
 
           # DNS resolution
           check "External DNS (google.com)" nslookup google.com
-          warn_check "Vistral DNS (cvat.vistral)" nslookup cvat.vistral
+          warn_check "Vistral DNS (cvat.vistral.dev)" nslookup cvat.vistral.dev
 
           # NFS accessibility
           NAS_IP="192.168.1.201"
