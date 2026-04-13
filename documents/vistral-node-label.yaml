@@ -47,13 +47,13 @@ mainSteps:
               exit 0
           fi
 
-          # Need kubectl access
+          # Need kubectl access — admin.conf on control planes, kubelet.conf on workers
           if [ -f /etc/kubernetes/admin.conf ]; then
               export KUBECONFIG=/etc/kubernetes/admin.conf
+          elif [ -f /etc/kubernetes/kubelet.conf ]; then
+              export KUBECONFIG=/etc/kubernetes/kubelet.conf
           else
-              # Workers don't have admin.conf — label via SSM on a control plane
-              # or use kubelet client cert. For now, skip on workers.
-              echo "No admin kubeconfig available. Node will be labeled by control plane."
+              echo "No kubeconfig available. Skipping."
               exit 0
           fi
 
