@@ -17,12 +17,11 @@ USB Boot → SSM Registration → State Manager triggers vistral-node-buildout
   ├─ Step 3: vistral-k8s-join           (onFailure: Abort, maxAttempts: 2)
   │           Detect role from hostname, join K8s cluster
   │
-  └─ Step 4: vistral-dns-setup          (onFailure: Continue)
-              Control planes: install CoreDNS
-              Workers: configure /etc/resolv.conf
+  └─ Step 4: vistral-wol-setup           (onFailure: Continue)
+              Enable Wake-on-LAN on GPU workers for powernap
 ```
 
-Each step waits for the previous one to complete. If K8s join fails, the runbook aborts — no point setting up DNS on a node that isn't in the cluster. T2 bootstrap and DNS setup are allowed to fail gracefully (non-Apple hardware, DNS already configured).
+Each step waits for the previous one to complete. If K8s join fails, the runbook aborts — no point configuring WOL on a node that isn't in the cluster. T2 bootstrap and WOL setup are allowed to fail gracefully (non-Apple hardware, non-GPU nodes).
 
 ## Documents
 

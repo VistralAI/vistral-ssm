@@ -14,7 +14,7 @@ description: |
      Dev nodes (VAUSD) skip this step.
   4. Node Label — apply labels and taints based on hardware/role (continues on failure)
   5. GPU Setup — install GPU Operator, configure time-slicing (continues on failure, not all nodes have GPUs)
-  6. DNS Setup — install CoreDNS on CPs, configure worker DNS (continues on failure)
+  6. WOL Setup — enable Wake-on-LAN on GPU workers for powernap (continues on failure)
   7. Platform Deploy — deploy Helm chart + ArgoCD, only on vausk01 (continues on failure)
   8. Health Check — validate all components, report status (always continues)
 
@@ -186,18 +186,16 @@ mainSteps:
         CloudWatchLogGroupName: /aws/ssm/vistral-buildout
         CloudWatchOutputEnabled: true
 
-  # Step 6: DNS setup
-  - name: dnsSetup
+  # Step 6: WOL setup (GPU workers — enable Wake-on-LAN for powernap)
+  - name: wolSetup
     action: aws:runCommand
     onFailure: Continue
-    timeoutSeconds: 900
+    timeoutSeconds: 300
     inputs:
-      DocumentName: vistral-dns-setup
+      DocumentName: vistral-wol-setup
       InstanceIds:
         - "{{InstanceId}}"
       Parameters:
-        VipAddress:
-          - "{{VipAddress}}"
         AWSRegion:
           - "{{AWSRegion}}"
       CloudWatchOutputConfig:
