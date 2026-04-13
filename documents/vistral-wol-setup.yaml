@@ -13,10 +13,6 @@ description: |
   Idempotent: Safe to run multiple times.
 
 parameters:
-  NetworkInterface:
-    type: String
-    description: "Network interface to enable WOL on"
-    default: "eth0"
   AWSRegion:
     type: String
     description: "AWS region for Secrets Manager"
@@ -32,14 +28,12 @@ mainSteps:
           #!/bin/bash
           set -e
 
-          IFACE="{{NetworkInterface}}"
           LOG="/var/log/vistral-wol-setup.log"
           exec > >(tee -a "$LOG") 2>&1
 
           echo "=============================================="
           echo "WOL Setup — $(date)"
           echo "=============================================="
-          echo "Interface: $IFACE"
 
           HOSTNAME=$(hostname | tr '[:upper:]' '[:lower:]')
 
@@ -61,36 +55,94 @@ mainSteps:
           fi
 
           # -----------------------------------------------
-          # Step 2: Enable WOL on the interface
+          # Step 2: Auto-detect physical NICs and enable WOL
           # -----------------------------------------------
-          echo "Enabling WOL on $IFACE..."
-          ethtool -s "$IFACE" wol g
+          # Find all physical network interfaces (exclude virtual: lo, docker, veth, cali, vxlan, tunl, bond slaves)
+          IFACES=()
+          for iface in /sys/class/net/*; do
+            name=$(basename "$iface")
+            # Skip loopback, virtual, container, and tunnel interfaces
+            [[ "$name" == lo ]] && continue
+            [[ "$name" == docker* ]] && continue
+            [[ "$name" == veth* ]] && continue
+            [[ "$name" == cali* ]] && continue
+            [[ "$name" == vxlan* ]] && continue
+            [[ "$name" == tunl* ]] && continue
+            [[ "$name" == flannel* ]] && continue
+            # Must be a physical device (has a device/ symlink pointing to PCI bus)
+            [[ ! -d "$iface/device" ]] && continue
+            # Must have carrier capability (real NIC, not USB serial etc)
+            IFACES+=("$name")
+          done
 
-          # Verify
-          WOL_STATUS=$(ethtool "$IFACE" | grep "Wake-on:" | tail -1 | awk '{print $2}')
-          if [[ "$WOL_STATUS" == *"g"* ]]; then
-            echo "WOL enabled successfully (Wake-on: $WOL_STATUS)"
-          else
-            echo "WARNING: WOL may not be enabled (Wake-on: $WOL_STATUS)"
-            echo "Check BIOS/UEFI settings — WOL must be enabled in firmware first"
+          if [[ ${#IFACES[@]} -eq 0 ]]; then
+            echo "ERROR: No physical network interfaces found"
+            exit 1
           fi
 
+          echo "Detected physical NICs: ${IFACES[*]}"
+
+          # Track the primary interface (first one with carrier/link up) for annotation
+          PRIMARY_IFACE=""
+          PRIMARY_MAC=""
+
+          # Build systemd service ExecStart lines for all interfaces
+          EXEC_LINES=""
+
+          for IFACE in "${IFACES[@]}"; do
+            echo ""
+            echo "--- Configuring WOL on $IFACE ---"
+
+            # Enable WOL
+            if ethtool -s "$IFACE" wol g 2>/dev/null; then
+              WOL_STATUS=$(ethtool "$IFACE" 2>/dev/null | grep "Wake-on:" | tail -1 | awk '{print $2}')
+              if [[ "$WOL_STATUS" == *"g"* ]]; then
+                echo "  WOL enabled (Wake-on: $WOL_STATUS)"
+              else
+                echo "  WARNING: WOL may not be supported on $IFACE (Wake-on: $WOL_STATUS)"
+                echo "  Check BIOS/UEFI settings — WOL must be enabled in firmware first"
+              fi
+            else
+              echo "  WARNING: ethtool failed on $IFACE — may not support WOL"
+              continue
+            fi
+
+            EXEC_LINES="${EXEC_LINES}ExecStart=/usr/sbin/ethtool -s ${IFACE} wol g\n"
+
+            # Use first link-up interface as primary for the node annotation
+            if [[ -z "$PRIMARY_IFACE" ]]; then
+              CARRIER=$(cat "/sys/class/net/$IFACE/carrier" 2>/dev/null || echo "0")
+              if [[ "$CARRIER" == "1" ]]; then
+                PRIMARY_IFACE="$IFACE"
+                PRIMARY_MAC=$(cat "/sys/class/net/$IFACE/address" 2>/dev/null)
+              fi
+            fi
+          done
+
+          # Fallback: if no interface had carrier, use the first one
+          if [[ -z "$PRIMARY_IFACE" ]]; then
+            PRIMARY_IFACE="${IFACES[0]}"
+            PRIMARY_MAC=$(cat "/sys/class/net/${IFACES[0]}/address" 2>/dev/null)
+          fi
+
+          echo ""
+          echo "Primary interface: $PRIMARY_IFACE (MAC: $PRIMARY_MAC)"
+
           # -----------------------------------------------
-          # Step 3: Persist WOL via systemd service
+          # Step 3: Persist WOL via systemd service (all NICs)
           # -----------------------------------------------
           SERVICE_FILE="/etc/systemd/system/wol-enable.service"
           echo "Creating systemd service at $SERVICE_FILE..."
 
           cat > "$SERVICE_FILE" << UNIT
           [Unit]
-          Description=Enable Wake-on-LAN on $IFACE
+          Description=Enable Wake-on-LAN on all physical NICs
           After=network-online.target
           Wants=network-online.target
 
           [Service]
           Type=oneshot
-          ExecStart=/usr/sbin/ethtool -s $IFACE wol g
-          RemainAfterExit=yes
+          $(echo -e "$EXEC_LINES")RemainAfterExit=yes
 
           [Install]
           WantedBy=multi-user.target
@@ -98,23 +150,18 @@ mainSteps:
 
           systemctl daemon-reload
           systemctl enable wol-enable.service
-          echo "WOL persistence service enabled"
+          echo "WOL persistence service enabled for: ${IFACES[*]}"
 
           # -----------------------------------------------
           # Step 4: Annotate Kubernetes node with MAC address
           # -----------------------------------------------
-          MAC_ADDR=$(cat "/sys/class/net/$IFACE/address" 2>/dev/null || ip link show "$IFACE" | grep link/ether | awk '{print $2}')
-
-          if [[ -z "$MAC_ADDR" ]]; then
-            echo "ERROR: Could not determine MAC address for $IFACE"
+          if [[ -z "$PRIMARY_MAC" ]]; then
+            echo "ERROR: Could not determine MAC address"
             exit 1
           fi
 
-          echo "MAC address: $MAC_ADDR"
-
           # Try to annotate — requires kubectl and kubeconfig
           if command -v kubectl &>/dev/null; then
-            # Try admin config (control plane) or kubelet config (worker)
             if [[ -f /etc/kubernetes/admin.conf ]]; then
               export KUBECONFIG=/etc/kubernetes/admin.conf
             elif [[ -f /etc/kubernetes/kubelet.conf ]]; then
@@ -122,19 +169,22 @@ mainSteps:
             fi
 
             if kubectl annotate node "$HOSTNAME" \
-              "vistral.ai/wol-mac=$MAC_ADDR" \
+              "vistral.ai/wol-mac=$PRIMARY_MAC" \
+              "vistral.ai/wol-interface=$PRIMARY_IFACE" \
               --overwrite 2>/dev/null; then
-              echo "Node annotated: vistral.ai/wol-mac=$MAC_ADDR"
+              echo "Node annotated: vistral.ai/wol-mac=$PRIMARY_MAC, vistral.ai/wol-interface=$PRIMARY_IFACE"
             else
               echo "WARNING: Could not annotate node $HOSTNAME"
               echo "Run manually from control plane:"
-              echo "  kubectl annotate node $HOSTNAME vistral.ai/wol-mac=$MAC_ADDR"
+              echo "  kubectl annotate node $HOSTNAME vistral.ai/wol-mac=$PRIMARY_MAC vistral.ai/wol-interface=$PRIMARY_IFACE"
             fi
           else
             echo "kubectl not found — annotate manually from control plane:"
-            echo "  kubectl annotate node $HOSTNAME vistral.ai/wol-mac=$MAC_ADDR"
+            echo "  kubectl annotate node $HOSTNAME vistral.ai/wol-mac=$PRIMARY_MAC vistral.ai/wol-interface=$PRIMARY_IFACE"
           fi
 
           echo "=============================================="
           echo "WOL setup complete for $HOSTNAME"
+          echo "  NICs configured: ${IFACES[*]}"
+          echo "  Primary (for WOL wake): $PRIMARY_IFACE ($PRIMARY_MAC)"
           echo "=============================================="
