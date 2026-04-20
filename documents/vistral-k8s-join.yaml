@@ -741,6 +741,27 @@ mainSteps:
               echo "Worker node join complete!"
           fi
 
+          # Annotate the node with its SSM instance ID so vistral-powernap can
+          # send shutdown commands via SSM RunCommand (reliable in hybrid
+          # cluster; SSH is not guaranteed). Source of truth in order:
+          #   1. /etc/vistral-ssm-instance-id (written by t2-bootstrap)
+          #   2. /var/lib/amazon/ssm/registration (SSM agent state)
+          echo "Annotating node with SSM instance ID for powernap controller..."
+          SSM_INSTANCE_ID=""
+          if [ -f /etc/vistral-ssm-instance-id ]; then
+              SSM_INSTANCE_ID=$(cat /etc/vistral-ssm-instance-id)
+          elif [ -f /var/lib/amazon/ssm/registration ]; then
+              SSM_INSTANCE_ID=$(jq -r '.ManagedInstanceID // empty' /var/lib/amazon/ssm/registration 2>/dev/null || echo "")
+          fi
+          if [ -n "$SSM_INSTANCE_ID" ]; then
+              sudo kubectl --kubeconfig=/etc/kubernetes/kubelet.conf annotate node "$(hostname)" \
+                  "vistral.ai/ssm-instance-id=$SSM_INSTANCE_ID" --overwrite 2>/dev/null || \
+                  echo "Warning: Failed to annotate node with SSM instance ID (controller will fall back to SSH)"
+              echo "Annotated node $(hostname) with vistral.ai/ssm-instance-id=$SSM_INSTANCE_ID"
+          else
+              echo "Warning: Could not determine SSM instance ID — powernap will fall back to SSH for shutdown"
+          fi
+
           # Cleanup
           echo "Cleaning up..."
           rm -f ~/.ssh/github_deploy
