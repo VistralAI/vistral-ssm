@@ -1,20 +1,25 @@
 schemaVersion: "2.2"
 description: |
-  Deploy vistral-stack Helm chart and bootstrap ArgoCD.
-  Runs on the primary control plane after the cluster is fully formed.
+  Deploy vistral-stack on the primary control plane. Thin wrapper around
+  vistral-stack/deploy.sh — that script is the single source of truth for
+  install/upgrade logic. The SSM doc handles concerns specific to remote
+  invocation (deploy-key handling, idempotency-skip-if-healthy, log path).
 
-  This document:
-  1. Clones vistral-stack from GitHub
-  2. Builds Helm dependencies
-  3. Installs the platform chart (or upgrades if already installed)
-  4. Bootstraps ArgoCD
+  Layout: vistral-stack is an App-of-Apps repo with 5 top-level Helm
+  charts (platform-infra, platform-core, platform-monitoring,
+  vistral-workloads, automation) plus an apps/ chart that generates
+  ArgoCD Applications. The pre-2026-04-12 monolith Chart.yaml at root
+  was deleted in commit 7764916.
 
-  Guard: Skips if vistral-platform is already deployed and healthy.
+  Guard: Skips when every top-level release is `deployed` AND every
+  Deployment is Available AND every StatefulSet is fully ready AND no
+  pods are stuck Pending/Failed. Anything less re-runs deploy.sh, which
+  is itself idempotent.
 
 parameters:
   DeployKeySecretName:
     type: String
-    description: "AWS Secrets Manager secret name containing GitHub deploy key"
+    description: "AWS Secrets Manager secret containing GitHub deploy key for vistral-stack"
     default: "vistral-github-deploy-key-platform"
   PlatformRepo:
     type: String
@@ -26,11 +31,11 @@ parameters:
     default: "us-east-1"
   Namespace:
     type: String
-    description: "Kubernetes namespace for the platform"
+    description: "Default platform namespace"
     default: "vistral-platform"
   ValuesOverride:
     type: String
-    description: "Optional values YAML override (base64 encoded)"
+    description: "Optional base64-encoded values YAML override (passed via VALUES_FILE env)"
     default: ""
 
 mainSteps:
@@ -42,7 +47,6 @@ mainSteps:
         - |
           #!/bin/bash
           set -e
-
           export HOME=/root
 
           DEPLOY_KEY_SECRET="{{DeployKeySecretName}}"
@@ -51,7 +55,6 @@ mainSteps:
           NAMESPACE="{{Namespace}}"
           VALUES_OVERRIDE="{{ValuesOverride}}"
           CHART_DIR="/opt/vistral-stack"
-          HELM_MANAGED_NAMESPACES="cvat automation video-processing"
 
           LOG="/var/log/vistral-platform-deploy.log"
           exec > >(tee -a "$LOG") 2>&1
@@ -61,56 +64,8 @@ mainSteps:
           echo "=============================================="
 
           # =========================================================
-          # Helper: force-delete a namespace by patching out its finalizer
+          # Guard: only run on primary control plane
           # =========================================================
-          force_delete_namespace() {
-              local ns="$1"
-              if ! kubectl get namespace "$ns" &>/dev/null; then
-                  return 0
-              fi
-              echo "  Force-deleting namespace $ns..."
-              # Trigger deletion
-              kubectl delete namespace "$ns" --ignore-not-found --wait=false 2>/dev/null || true
-              # If stuck terminating, patch out the kubernetes finalizer directly
-              if kubectl get namespace "$ns" &>/dev/null; then
-                  kubectl get namespace "$ns" -o json 2>/dev/null \
-                      | python3 -c "import sys,json; d=json.load(sys.stdin); d['spec']['finalizers']=[]; print(json.dumps(d))" \
-                      | kubectl replace --raw "/api/v1/namespaces/$ns/finalize" -f - 2>/dev/null || true
-              fi
-              # Brief wait for it to disappear
-              kubectl wait --for=delete namespace/"$ns" --timeout=30s 2>/dev/null || true
-          }
-
-          force_clean_namespaces() {
-              for ns in $HELM_MANAGED_NAMESPACES; do
-                  force_delete_namespace "$ns"
-              done
-          }
-
-          # =========================================================
-          # Helper: full release cleanup after failure
-          # =========================================================
-          cleanup_failed_release() {
-              echo "Cleaning up failed release (preserving PVCs and namespaces)..."
-              helm uninstall vistral-platform -n "$NAMESPACE" --no-hooks --wait=false 2>/dev/null || true
-              # Clear stuck Helm operations (pending-install/pending-upgrade locks)
-              kubectl delete secret -n "$NAMESPACE" -l owner=helm,status=pending-install --ignore-not-found 2>/dev/null || true
-              kubectl delete secret -n "$NAMESPACE" -l owner=helm,status=pending-upgrade --ignore-not-found 2>/dev/null || true
-              kubectl delete secret -n "$NAMESPACE" -l owner=helm,status=pending-rollback --ignore-not-found 2>/dev/null || true
-              # Clean webhooks that block future installs
-              kubectl delete validatingwebhookconfiguration ingress-nginx-admission --ignore-not-found 2>/dev/null || true
-              kubectl delete mutatingwebhookconfiguration ingress-nginx-admission --ignore-not-found 2>/dev/null || true
-              kubectl delete validatingwebhookconfiguration -l app.kubernetes.io/managed-by=Helm --ignore-not-found 2>/dev/null || true
-              kubectl delete mutatingwebhookconfiguration -l app.kubernetes.io/managed-by=Helm --ignore-not-found 2>/dev/null || true
-              # NOTE: PVCs and namespaces are intentionally preserved on failure.
-              # Deleting them destroys database data and is unrecoverable.
-          }
-
-          # =========================================================
-          # Guards
-          # =========================================================
-
-          # Must be primary control plane
           if [ ! -f /etc/kubernetes/admin.conf ]; then
               echo "Not a control plane. Skipping platform deploy."
               exit 0
@@ -118,101 +73,85 @@ mainSteps:
           export KUBECONFIG=/etc/kubernetes/admin.conf
 
           HOSTNAME=$(hostname | tr '[:upper:]' '[:lower:]')
-          # Only run on vausk01 to avoid duplicate deploys
           if [ "$HOSTNAME" != "vausk01" ]; then
               echo "Platform deploy runs only on vausk01. Current: $HOSTNAME. Skipping."
               exit 0
           fi
 
-          # P1 #6 hardened guard: helm status=deployed alone is not enough.
-          # A release can be `deployed` with crash-looping pods, missing
-          # ingress, or unbound PVCs. Skip only if status=deployed AND every
-          # core component reports Ready.
-          if helm status vistral-platform -n "$NAMESPACE" &>/dev/null; then
-              RELEASE_STATUS=$(helm status vistral-platform -n "$NAMESPACE" -o json 2>/dev/null | jq -r '.info.status' 2>/dev/null || echo "unknown")
-              if [ "$RELEASE_STATUS" = "deployed" ]; then
-                  PLATFORM_HEALTHY=true
-                  # L3a: every Deployment Available
-                  if ! kubectl -n "$NAMESPACE" wait deployment --all \
-                          --for=condition=Available --timeout=15s &>/dev/null; then
-                      PLATFORM_HEALTHY=false
-                  fi
-                  # L3b: every StatefulSet replicas == ready
-                  if [ "$PLATFORM_HEALTHY" = "true" ]; then
-                      while IFS=$'\t' read -r name desired ready; do
-                          [ -z "$name" ] && continue
-                          if [ "${ready:-0}" != "$desired" ]; then
-                              echo "StatefulSet $name not fully ready ($ready/$desired) — re-running deploy"
-                              PLATFORM_HEALTHY=false
-                              break
-                          fi
-                      done < <(kubectl -n "$NAMESPACE" get statefulset \
-                              -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.replicas}{"\t"}{.status.readyReplicas}{"\n"}{end}' 2>/dev/null)
-                  fi
-                  # L3c: no pods stuck Pending/CrashLoopBackOff
-                  if [ "$PLATFORM_HEALTHY" = "true" ]; then
-                      STUCK=$(kubectl -n "$NAMESPACE" get pods \
-                          --field-selector=status.phase!=Running,status.phase!=Succeeded \
-                          -o name 2>/dev/null | wc -l)
-                      if [ "$STUCK" -gt 0 ]; then
-                          echo "$STUCK pod(s) stuck Pending/Failed — re-running deploy"
-                          PLATFORM_HEALTHY=false
-                      fi
-                  fi
-                  if [ "$PLATFORM_HEALTHY" = "true" ]; then
-                      echo "Platform deployed and all components healthy. Skipping."
-                      exit 0
-                  fi
-              elif [ "$RELEASE_STATUS" = "failed" ] || [ "$RELEASE_STATUS" = "pending-install" ] || [ "$RELEASE_STATUS" = "pending-rollback" ] || [ "$RELEASE_STATUS" = "uninstalling" ]; then
-                  echo "Platform in broken state: $RELEASE_STATUS. Cleaning up before retry..."
-                  cleanup_failed_release
-              else
-                  echo "Platform exists but status: $RELEASE_STATUS. Will attempt upgrade."
+          # =========================================================
+          # Idempotency guard (P1 #6): skip only if EVERY top-level
+          # release is `deployed` AND the platform namespace looks
+          # healthy. Any failure short-circuits and re-runs deploy.sh.
+          # =========================================================
+          PLATFORM_HEALTHY=true
+          REQUIRED_RELEASES="platform-infra platform-core platform-monitoring vistral-workloads automation"
+          for r in $REQUIRED_RELEASES; do
+              S=$(helm status "$r" -n "$NAMESPACE" -o json 2>/dev/null | jq -r '.info.status' 2>/dev/null || echo "missing")
+              if [ "$S" != "deployed" ]; then
+                  echo "Release $r status=$S (need deployed) — re-running deploy"
+                  PLATFORM_HEALTHY=false
+                  break
               fi
+          done
+          if [ "$PLATFORM_HEALTHY" = "true" ]; then
+              if ! kubectl -n "$NAMESPACE" wait deployment --all \
+                      --for=condition=Available --timeout=15s &>/dev/null; then
+                  echo "Some Deployment in $NAMESPACE not Available — re-running deploy"
+                  PLATFORM_HEALTHY=false
+              fi
+          fi
+          if [ "$PLATFORM_HEALTHY" = "true" ]; then
+              while IFS=$'\t' read -r name desired ready; do
+                  [ -z "$name" ] && continue
+                  if [ "${ready:-0}" != "$desired" ]; then
+                      echo "StatefulSet $name not fully ready ($ready/$desired) — re-running deploy"
+                      PLATFORM_HEALTHY=false
+                      break
+                  fi
+              done < <(kubectl -n "$NAMESPACE" get statefulset \
+                      -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.replicas}{"\t"}{.status.readyReplicas}{"\n"}{end}' 2>/dev/null)
+          fi
+          if [ "$PLATFORM_HEALTHY" = "true" ]; then
+              STUCK=$(kubectl -n "$NAMESPACE" get pods \
+                  --field-selector=status.phase!=Running,status.phase!=Succeeded \
+                  -o name 2>/dev/null | wc -l | tr -d ' ')
+              if [ "$STUCK" -gt 0 ]; then
+                  echo "$STUCK pod(s) stuck Pending/Failed — re-running deploy"
+                  PLATFORM_HEALTHY=false
+              fi
+          fi
+          if [ "$PLATFORM_HEALTHY" = "true" ]; then
+              echo "All releases deployed and healthy. Skipping."
+              exit 0
           fi
 
           # =========================================================
-          # Prerequisites
+          # Prerequisites: AWS CLI + Helm + jq
           # =========================================================
-
           if ! command -v aws &>/dev/null; then
               echo "Installing AWS CLI v2..."
               cd /tmp
-              curl -sL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+              curl -sL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o awscliv2.zip
               unzip -q awscliv2.zip
               ./aws/install --update
               rm -rf awscliv2.zip aws
           fi
-
           if ! command -v helm &>/dev/null; then
               echo "Installing Helm..."
               curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
           fi
-
-          # Host prerequisites — Longhorn needs iSCSI
-          echo "Checking host prerequisites..."
-          if ! command -v iscsiadm &>/dev/null; then
-              echo "  Installing open-iscsi for Longhorn..."
-              apt-get update -qq && apt-get install -y -qq open-iscsi 2>&1 || echo "  WARNING: failed to install open-iscsi"
-          fi
-          if ! systemctl is-active --quiet iscsid 2>/dev/null; then
-              systemctl enable --now iscsid || echo "  WARNING: failed to enable iscsid"
-          fi
-          if ! lsmod | grep -q iscsi_tcp 2>/dev/null; then
-              modprobe iscsi_tcp || echo "  WARNING: failed to load iscsi_tcp"
-              echo "iscsi_tcp" > /etc/modules-load.d/iscsi.conf 2>/dev/null || true
+          if ! command -v jq &>/dev/null; then
+              apt-get update -qq && apt-get install -y -qq jq 2>&1 || true
           fi
 
           # =========================================================
-          # Clone & build
+          # Clone vistral-stack
           # =========================================================
-
-          # Get deploy key
           DEPLOY_KEY=$(aws secretsmanager get-secret-value \
               --secret-id "$DEPLOY_KEY_SECRET" \
               --region "$AWS_REGION" \
-              --query SecretString \
-              --output text) || { echo "ERROR: Failed to get deploy key"; exit 1; }
+              --query SecretString --output text) \
+              || { echo "ERROR: failed to read deploy key from $DEPLOY_KEY_SECRET"; exit 1; }
 
           mkdir -p ~/.ssh
           echo "$DEPLOY_KEY" > ~/.ssh/github_deploy
@@ -220,253 +159,44 @@ mainSteps:
           ssh-keyscan github.com >> ~/.ssh/known_hosts 2>/dev/null
           export GIT_SSH_COMMAND="ssh -i ~/.ssh/github_deploy -o StrictHostKeyChecking=no"
 
-          echo "Cloning vistral-stack..."
+          echo "Cloning $PLATFORM_REPO -> $CHART_DIR"
           rm -rf "$CHART_DIR"
-          git clone "$PLATFORM_REPO" "$CHART_DIR" || {
-              echo "ERROR: Failed to clone platform repo"
-              rm -f ~/.ssh/github_deploy
-              exit 1
-          }
-
-          # Always cd to chart dir with absolute path (avoids getwd errors)
-          cd "$CHART_DIR"
-
-          # Always build fresh dependencies (needed for CRD extraction before repack)
-          echo "Building Helm dependencies..."
-          helm dependency build 2>/dev/null || helm dependency update
+          git clone "$PLATFORM_REPO" "$CHART_DIR" || { echo "ERROR: git clone failed"; rm -f ~/.ssh/github_deploy; exit 1; }
 
           # =========================================================
-          # Pre-install CRDs (Helm doesn't reinstall CRDs on upgrade/reinstall)
+          # Materialize values override (if provided)
           # =========================================================
-          # Some subcharts (Longhorn, KEDA, External Secrets) put CRDs in
-          # templates/ instead of crds/, so they get deleted on helm uninstall.
-          # We extract and apply them directly to survive install/uninstall cycles.
-
-          echo "Pre-installing CRDs from subcharts..."
-
-          # We manage CRDs outside Helm because:
-          # 1. Some charts put CRDs in templates/ which get deleted on helm uninstall
-          # 2. Helm doesn't reinstall CRDs on upgrade
-          # 3. Helm refuses to adopt pre-existing CRDs without ownership labels
-          # Solution: apply CRDs ourselves, tell Helm to --skip-crds
-
-          if [ -f charts/longhorn-*.tgz ]; then
-              echo "  Longhorn CRDs..."
-              LONGHORN_TGZ=$(ls charts/longhorn-*.tgz)
-              helm template longhorn-crds "$LONGHORN_TGZ" --show-only templates/crds.yaml 2>/dev/null \
-                  | kubectl apply --server-side --force-conflicts -f - 2>/dev/null || true
-              # Remove crds.yaml from the tarball so Helm doesn't try to manage them
-              # (Longhorn puts CRDs in templates/ with no conditional, --skip-crds doesn't apply)
-              CRD_REPACK=$(mktemp -d)
-              tar xzf "$LONGHORN_TGZ" -C "$CRD_REPACK"
-              rm -f "$CRD_REPACK/longhorn/templates/crds.yaml"
-              tar czf "$LONGHORN_TGZ" -C "$CRD_REPACK" longhorn
-              rm -rf "$CRD_REPACK"
-          fi
-
-          if [ -f charts/keda-*.tgz ]; then
-              echo "  KEDA CRDs..."
-              helm template keda-crds charts/keda-*.tgz --show-only templates/crds/*.yaml 2>/dev/null \
-                  | kubectl apply --server-side --force-conflicts -f - 2>/dev/null || true
-          fi
-
-          if [ -f charts/external-secrets-*.tgz ]; then
-              echo "  External Secrets CRDs..."
-              helm template es-crds charts/external-secrets-*.tgz --show-only templates/crds/*.yaml \
-                  --set installCRDs=true 2>/dev/null \
-                  | kubectl apply --server-side --force-conflicts -f - 2>/dev/null || true
-          fi
-
-          echo "CRDs pre-installed"
-
-          # =========================================================
-          # Bootstrap secrets (release namespace only)
-          # =========================================================
-
-          kubectl create namespace "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
-
-          echo "Secrets managed by External Secrets Operator (source: AWS Secrets Manager vistral-db-passwords)"
-
-          # ESO needs AWS credentials to read from Secrets Manager
-          kubectl create namespace external-secrets --dry-run=client -o yaml | kubectl apply -f -
-          if ! kubectl get secret aws-credentials -n external-secrets &>/dev/null; then
-              echo "Creating AWS credentials for External Secrets Operator..."
-              ESO_ACCESS_KEY=$(aws secretsmanager get-secret-value --secret-id vistral/eso-credentials --region us-east-1 --query SecretString --output text 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['access-key-id'])" 2>/dev/null || echo "")
-              ESO_SECRET_KEY=$(aws secretsmanager get-secret-value --secret-id vistral/eso-credentials --region us-east-1 --query SecretString --output text 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['secret-access-key'])" 2>/dev/null || echo "")
-              if [ -n "$ESO_ACCESS_KEY" ] && [ -n "$ESO_SECRET_KEY" ]; then
-                  kubectl create secret generic aws-credentials \
-                      --namespace external-secrets \
-                      --from-literal=access-key-id="$ESO_ACCESS_KEY" \
-                      --from-literal=secret-access-key="$ESO_SECRET_KEY" \
-                      --dry-run=client -o yaml | kubectl apply -f -
-              else
-                  echo "WARNING: Could not fetch ESO credentials from vistral/eso-credentials"
-              fi
-          fi
-
-          # NGC image pull secret for NVIDIA container registry
-          if ! kubectl get secret ngc-secret -n "$NAMESPACE" &>/dev/null; then
-              echo "Creating NGC image pull secret..."
-              NGC_KEY=$(aws secretsmanager get-secret-value --secret-id vistral/ngc-api-key --region us-east-1 --query SecretString --output text 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['api-key'])" 2>/dev/null || echo "")
-              if [ -n "$NGC_KEY" ]; then
-                  kubectl create secret docker-registry ngc-secret \
-                      --namespace "$NAMESPACE" \
-                      --docker-server=nvcr.io \
-                      --docker-username='$oauthtoken' \
-                      --docker-password="$NGC_KEY" \
-                      --dry-run=client -o yaml | kubectl apply -f -
-              else
-                  echo "WARNING: Could not fetch NGC API key from vistral/ngc-api-key"
-              fi
-          fi
-
-          # =========================================================
-          # Pre-install cleanup
-          # =========================================================
-
-          # Prepare values override
-          VALUES_ARGS="-f values.yaml"
           if [ -n "$VALUES_OVERRIDE" ]; then
               echo "$VALUES_OVERRIDE" | base64 -d > /tmp/override-values.yaml
-              VALUES_ARGS="$VALUES_ARGS -f /tmp/override-values.yaml"
+              export VALUES_FILE=/tmp/override-values.yaml
           fi
 
-          # Clean stale admission webhooks
-          echo "Cleaning stale resources..."
-          kubectl delete validatingwebhookconfiguration ingress-nginx-admission --ignore-not-found 2>/dev/null || true
-          kubectl delete mutatingwebhookconfiguration ingress-nginx-admission --ignore-not-found 2>/dev/null || true
+          # =========================================================
+          # Delegate to vistral-stack/deploy.sh — single source of
+          # truth for install/upgrade logic (App-of-Apps layout).
+          # deploy.sh handles SSM lookup + per-chart install + ArgoCD
+          # bootstrap + App-of-Apps chart.
+          # =========================================================
+          export AWS_PROFILE="${AWS_PROFILE:-}"   # SSM agent runs under instance role; profile not needed
+          export AWS_REGION
+          export NAMESPACE
+          export KUBECONFIG
 
-          # Adopt orphaned namespaces that exist without Helm ownership labels.
-          # These block helm install because Helm refuses to adopt unlabeled resources.
-          echo "Adopting orphaned namespaces for Helm..."
-          for ns in external-secrets "$NAMESPACE"; do
-              if kubectl get namespace "$ns" &>/dev/null; then
-                  HAS_MANAGED=$(kubectl get namespace "$ns" -o jsonpath='{.metadata.labels.app\.kubernetes\.io/managed-by}' 2>/dev/null)
-                  if [ "$HAS_MANAGED" != "Helm" ]; then
-                      echo "  Labeling namespace $ns for Helm adoption"
-                      kubectl label namespace "$ns" app.kubernetes.io/managed-by=Helm --overwrite 2>/dev/null || true
-                      kubectl annotate namespace "$ns" \
-                          meta.helm.sh/release-name=vistral-platform \
-                          meta.helm.sh/release-namespace="$NAMESPACE" --overwrite 2>/dev/null || true
-                  fi
-              fi
-          done
-
-          # Clean orphaned cluster-scoped resources from previous failed installs.
-          # These have stale Helm ownership labels pointing to a deleted release.
-          echo "Cleaning orphaned cluster-scoped resources..."
-          if ! helm status vistral-platform -n "$NAMESPACE" &>/dev/null; then
-              for resource_type in clusterrole clusterrolebinding; do
-                  kubectl get "$resource_type" \
-                      -l app.kubernetes.io/managed-by=Helm \
-                      -o jsonpath='{range .items[?(@.metadata.annotations.meta\.helm\.sh/release-name=="vistral-platform")]}{.metadata.name}{"\n"}{end}' \
-                      2>/dev/null | while read -r name; do
-                      [ -z "$name" ] && continue
-                      echo "  Deleting orphaned $resource_type/$name"
-                      kubectl delete "$resource_type" "$name" --ignore-not-found 2>/dev/null || true
-                  done
-              done
+          if [ ! -x "$CHART_DIR/deploy.sh" ]; then
+              chmod +x "$CHART_DIR/deploy.sh"
           fi
 
-          # Force-clean any terminating namespaces from previous failed runs
-          force_clean_namespaces
-
-          # =========================================================
-          # Phase 1: Install operators (CRDs first, skip custom resources)
-          # =========================================================
-
-          echo "Phase 1: Installing operators (CRDs)..."
-          cd "$CHART_DIR"
-          if ! helm upgrade --install vistral-platform . \
-              --namespace "$NAMESPACE" \
-              --create-namespace \
-              --skip-crds \
-              $VALUES_ARGS \
-              --set global.skipCustomResources=true \
-              --set longhorn.enableCRDs=false \
-              --set keda.crds.install=false \
-              --set external-secrets.installCRDs=false \
-              --timeout 10m; then
-              echo "Phase 1 failed."
-              cleanup_failed_release
-              exit 1
-          fi
-
-          # Wait for operator CRDs to be registered
-          echo "Waiting for CRDs..."
-          for crd in externalsecrets.external-secrets.io scaledjobs.keda.sh; do
-              for i in $(seq 1 60); do
-                  if kubectl get crd "$crd" &>/dev/null; then
-                      echo "  CRD $crd ready"
-                      break
-                  fi
-                  if [ "$i" -eq 60 ]; then
-                      echo "  WARNING: CRD $crd not found after 5 minutes, continuing anyway"
-                  fi
-                  sleep 5
-              done
-          done
-
-          # Wait for ESO webhook to be ready before Phase 2 creates ExternalSecret CRs.
-          # The webhook validates all ExternalSecret/ClusterSecretStore resources —
-          # if it's not ready, Phase 2 fails with "connection refused".
-          echo "Waiting for External Secrets webhook..."
-          for attempt in $(seq 1 60); do
-              if kubectl get pods -n "$NAMESPACE" -l app.kubernetes.io/name=external-secrets-webhook \
-                  --no-headers 2>/dev/null | grep -q "1/1"; then
-                  echo "  ESO webhook pod ready"
-                  sleep 5
-                  break
-              fi
-              if [ "$attempt" -eq 60 ]; then
-                  echo "  WARNING: ESO webhook not ready after 120s, continuing anyway"
-              fi
-              sleep 2
-          done
-
-          # Delete stale ESO webhook configs — cert controller will recreate them
-          # once the webhook TLS certs are fully initialized
-          echo "Cleaning stale ESO webhook configs..."
-          kubectl delete validatingwebhookconfiguration \
-              externalsecret-validate secretstore-validate \
-              --ignore-not-found 2>/dev/null || true
-
-          # =========================================================
-          # Phase 2: Full deploy with custom resources enabled
-          # =========================================================
-
-          echo "Phase 2: Full platform deployment..."
-          cd "$CHART_DIR"
-          if ! helm upgrade vistral-platform . \
-              --namespace "$NAMESPACE" \
-              --skip-crds \
-              $VALUES_ARGS \
-              --set longhorn.enableCRDs=false \
-              --set keda.crds.install=false \
-              --set external-secrets.installCRDs=false \
-              --timeout 45m; then
-              echo "Phase 2 failed."
-              cleanup_failed_release
-              exit 1
-          fi
-
-          echo "Platform deployment complete"
-
-          # =========================================================
-          # Post-deploy: ArgoCD bootstrap
-          # =========================================================
-
-          if [ -f argocd/install.sh ]; then
-              echo "Bootstrapping ArgoCD..."
-              cd "$CHART_DIR/argocd"
-              chmod +x install.sh
-              bash install.sh
-              echo "ArgoCD bootstrap complete"
-          fi
+          bash "$CHART_DIR/deploy.sh"
+          DEPLOY_RC=$?
 
           # Cleanup
           rm -f ~/.ssh/github_deploy
           rm -f /tmp/override-values.yaml
+
+          if [ "$DEPLOY_RC" -ne 0 ]; then
+              echo "FATAL: deploy.sh exited with $DEPLOY_RC"
+              exit "$DEPLOY_RC"
+          fi
 
           echo "=============================================="
           echo "Platform deployment complete at $(date)"
