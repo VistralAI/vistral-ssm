@@ -37,6 +37,22 @@ parameters:
     type: String
     description: "Optional base64-encoded values YAML override (passed via VALUES_FILE env)"
     default: ""
+  # P1 #5: forwarded by vistral-node-buildout from State Manager (which
+  # gets them from /vistral/* in SSM Parameter Store). These values are
+  # exported into the env so deploy.sh doesn't need ssm:GetParameter
+  # permission — the hybrid instance role doesn't grant that.
+  NasServerIp:
+    type: String
+    description: "NAS server IP (from /vistral/infrastructure/nas-server-ip)"
+    default: ""
+  NasBasePath:
+    type: String
+    description: "NAS base path (from /vistral/infrastructure/nas-base-path)"
+    default: ""
+  ContainerRegistry:
+    type: String
+    description: "Container registry endpoint host:port (from /vistral/registry/endpoint)"
+    default: ""
 
 mainSteps:
   - action: aws:runShellScript
@@ -174,20 +190,35 @@ mainSteps:
           # =========================================================
           # Delegate to vistral-stack/deploy.sh — single source of
           # truth for install/upgrade logic (App-of-Apps layout).
-          # deploy.sh handles SSM lookup + per-chart install + ArgoCD
-          # bootstrap + App-of-Apps chart.
+          # P1 #5: pre-export the SSM-sourced values forwarded by the
+          # State Manager Association so deploy.sh doesn't need
+          # ssm:GetParameter permission (the hybrid instance role
+          # AmazonSSMManagedInstanceCore doesn't grant it).
           # =========================================================
-          export AWS_PROFILE="${AWS_PROFILE:-}"   # SSM agent runs under instance role; profile not needed
+          export AWS_PROFILE=""           # SSM agent uses instance role; clear any inherited profile
           export AWS_REGION
           export NAMESPACE
           export KUBECONFIG
+          export NAS_SERVER="{{NasServerIp}}"
+          export NAS_BASE_PATH="{{NasBasePath}}"
+          export CONTAINER_REGISTRY="{{ContainerRegistry}}"
+
+          if [[ -z "$NAS_SERVER" || -z "$NAS_BASE_PATH" || -z "$CONTAINER_REGISTRY" ]]; then
+              echo "ERROR: NasServerIp / NasBasePath / ContainerRegistry parameters not provided"
+              echo "Verify vistral-node-buildout forwards them from State Manager Association"
+              exit 1
+          fi
 
           if [ ! -x "$CHART_DIR/deploy.sh" ]; then
               chmod +x "$CHART_DIR/deploy.sh"
           fi
 
+          # Don't `set -e`-fail on deploy.sh non-zero — capture exit and
+          # propagate explicitly so the cleanup at the end always runs.
+          set +e
           bash "$CHART_DIR/deploy.sh"
           DEPLOY_RC=$?
+          set -e
 
           # Cleanup
           rm -f ~/.ssh/github_deploy

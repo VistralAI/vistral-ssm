@@ -244,6 +244,12 @@ mainSteps:
           - "{{PlatformRepo}}"
         AWSRegion:
           - "{{AWSRegion}}"
+        NasServerIp:
+          - "{{NasServerIp}}"
+        NasBasePath:
+          - "{{NasBasePath}}"
+        ContainerRegistry:
+          - "{{ContainerRegistry}}"
       CloudWatchOutputConfig:
         CloudWatchLogGroupName: /aws/ssm/vistral-buildout
         CloudWatchOutputEnabled: true
