@@ -50,15 +50,52 @@ mainSteps:
           fi
           export KUBECONFIG=/etc/kubernetes/admin.conf
 
-          # Guard: check if GPU Operator is already deployed
-          if kubectl get pods -n gpu-operator -l app=gpu-operator 2>/dev/null | grep -q Running; then
-              echo "GPU Operator already running. Skipping installation."
+          # P1 #6 hardened guard: "operator pods Running" is not the same as
+          # "GPU operator is healthy." A pod can be Running while
+          # ClusterPolicy is reconciling, the driver DaemonSet has crashing
+          # pods on a subset of nodes, or DCGM has not yet exposed metrics.
+          # Layered probe (L1 file → L3 functional → cross-resource invariant):
+          OPERATOR_HEALTHY=true
 
-              # Still check time-slicing config
-              if kubectl get configmap -n gpu-operator gpu-time-slicing-config &>/dev/null; then
-                  echo "Time-slicing config already exists."
+          # L3a: gpu-operator deployment must be Available
+          if ! kubectl -n gpu-operator wait deployment -l app=gpu-operator \
+                  --for=condition=Available --timeout=10s &>/dev/null; then
+              OPERATOR_HEALTHY=false
+          fi
+
+          # L3b: ClusterPolicy must report Ready (or any state value
+          # indicating reconciled). Older operator versions may not expose
+          # this; tolerate absence but never accept "NotReady".
+          if [ "$OPERATOR_HEALTHY" = "true" ]; then
+              CP_STATE=$(kubectl get clusterpolicy --no-headers -o custom-columns=STATE:.status.state 2>/dev/null | head -1)
+              if [ -n "$CP_STATE" ] && [ "$CP_STATE" != "ready" ]; then
+                  echo "ClusterPolicy state is '$CP_STATE' (not ready) — re-running setup"
+                  OPERATOR_HEALTHY=false
+              fi
+          fi
+
+          # L3c: at least one node with nvidia.com/gpu allocatable > 0
+          # (means drivers + device plugin actually delivered capacity).
+          if [ "$OPERATOR_HEALTHY" = "true" ]; then
+              GPU_NODES=$(kubectl get nodes -o jsonpath='{range .items[*]}{.status.allocatable.nvidia\.com/gpu}{"\n"}{end}' 2>/dev/null | grep -cv '^0\?$' || true)
+              if [ "${GPU_NODES:-0}" -lt 1 ]; then
+                  echo "No node reports nvidia.com/gpu capacity yet — re-running setup"
+                  OPERATOR_HEALTHY=false
+              fi
+          fi
+
+          if [ "$OPERATOR_HEALTHY" = "true" ]; then
+              echo "GPU Operator healthy (deployment Available + ClusterPolicy ready + GPU capacity advertised)."
+
+              # Time-slicing: configmap presence alone is not enough — verify
+              # the node-level time-slicing label is set on at least one GPU
+              # node, which is the signal the operator actually applied it.
+              if kubectl get configmap -n gpu-operator gpu-time-slicing-config &>/dev/null \
+                  && kubectl get nodes -l nvidia.com/device-plugin.config -o name 2>/dev/null | grep -q . ; then
+                  echo "Time-slicing applied to nodes. Skipping installation."
                   exit 0
               fi
+              echo "Time-slicing not yet applied — proceeding to (re)apply config."
           else
               echo "Installing GPU Operator (pre-provisioning for GPU workers)..."
 

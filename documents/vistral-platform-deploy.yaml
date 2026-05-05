@@ -124,12 +124,45 @@ mainSteps:
               exit 0
           fi
 
-          # Guard: check if platform is already deployed and healthy
+          # P1 #6 hardened guard: helm status=deployed alone is not enough.
+          # A release can be `deployed` with crash-looping pods, missing
+          # ingress, or unbound PVCs. Skip only if status=deployed AND every
+          # core component reports Ready.
           if helm status vistral-platform -n "$NAMESPACE" &>/dev/null; then
               RELEASE_STATUS=$(helm status vistral-platform -n "$NAMESPACE" -o json 2>/dev/null | jq -r '.info.status' 2>/dev/null || echo "unknown")
               if [ "$RELEASE_STATUS" = "deployed" ]; then
-                  echo "Platform already deployed (status: $RELEASE_STATUS). Skipping."
-                  exit 0
+                  PLATFORM_HEALTHY=true
+                  # L3a: every Deployment Available
+                  if ! kubectl -n "$NAMESPACE" wait deployment --all \
+                          --for=condition=Available --timeout=15s &>/dev/null; then
+                      PLATFORM_HEALTHY=false
+                  fi
+                  # L3b: every StatefulSet replicas == ready
+                  if [ "$PLATFORM_HEALTHY" = "true" ]; then
+                      while IFS=$'\t' read -r name desired ready; do
+                          [ -z "$name" ] && continue
+                          if [ "${ready:-0}" != "$desired" ]; then
+                              echo "StatefulSet $name not fully ready ($ready/$desired) — re-running deploy"
+                              PLATFORM_HEALTHY=false
+                              break
+                          fi
+                      done < <(kubectl -n "$NAMESPACE" get statefulset \
+                              -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.replicas}{"\t"}{.status.readyReplicas}{"\n"}{end}' 2>/dev/null)
+                  fi
+                  # L3c: no pods stuck Pending/CrashLoopBackOff
+                  if [ "$PLATFORM_HEALTHY" = "true" ]; then
+                      STUCK=$(kubectl -n "$NAMESPACE" get pods \
+                          --field-selector=status.phase!=Running,status.phase!=Succeeded \
+                          -o name 2>/dev/null | wc -l)
+                      if [ "$STUCK" -gt 0 ]; then
+                          echo "$STUCK pod(s) stuck Pending/Failed — re-running deploy"
+                          PLATFORM_HEALTHY=false
+                      fi
+                  fi
+                  if [ "$PLATFORM_HEALTHY" = "true" ]; then
+                      echo "Platform deployed and all components healthy. Skipping."
+                      exit 0
+                  fi
               elif [ "$RELEASE_STATUS" = "failed" ] || [ "$RELEASE_STATUS" = "pending-install" ] || [ "$RELEASE_STATUS" = "pending-rollback" ] || [ "$RELEASE_STATUS" = "uninstalling" ]; then
                   echo "Platform in broken state: $RELEASE_STATUS. Cleaning up before retry..."
                   cleanup_failed_release

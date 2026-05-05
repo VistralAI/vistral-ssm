@@ -41,9 +41,17 @@ mainSteps:
               exit 0
           fi
 
-          # Must be in cluster
+          # P1 #6 hardened guard: file existence ≠ kubelet healthy.
+          # If kubelet.conf exists but kubelet is dead, skipping here would
+          # leave the node unlabelled forever (no rejoin happens because
+          # vistral-k8s-join's own guard might also pass). Require kubelet
+          # active + API reachable before deciding to skip-or-label.
           if [ ! -f /etc/kubernetes/kubelet.conf ]; then
               echo "Not in a cluster yet. Skipping."
+              exit 0
+          fi
+          if ! systemctl is-active --quiet kubelet 2>/dev/null; then
+              echo "kubelet present but not active. Skipping (k8s-join will handle reset)."
               exit 0
           fi
 
@@ -57,12 +65,11 @@ mainSteps:
               exit 0
           fi
 
-          # Guard: check if already labeled
+          # P1 #6 hardened guard: a label exists ≠ correct label.
+          # Detect hardware again and only skip if the existing label still
+          # matches what we'd assign now. Otherwise re-label (handles
+          # GPU added/removed, hostname-pattern policy changes).
           EXISTING=$(kubectl get node "$HOSTNAME" -o jsonpath='{.metadata.labels.vistral\.ai/node-type}' 2>/dev/null || echo "")
-          if [ -n "$EXISTING" ]; then
-              echo "Node already labeled: node-type=$EXISTING. Skipping."
-              exit 0
-          fi
 
           # Detect hardware
           HAS_GPU=false
@@ -86,6 +93,19 @@ mainSteps:
           fi
 
           echo "Hardware: $HARDWARE, GPU: $HAS_GPU"
+
+          # Determine the label this run *would* set, then compare to existing.
+          if [[ "$HOSTNAME" =~ ^vausk[0-9]+$ ]]; then
+              EXPECTED_TYPE="control-plane"
+          elif [[ "$HOSTNAME" =~ ^vausw[0-9]+$ ]] || [[ "$HOSTNAME" =~ ^vausm[0-9]+$ ]]; then
+              EXPECTED_TYPE="worker"
+          else
+              EXPECTED_TYPE=""
+          fi
+          if [ -n "$EXISTING" ] && [ "$EXISTING" = "$EXPECTED_TYPE" ]; then
+              echo "Node already labeled correctly: node-type=$EXISTING. Skipping."
+              exit 0
+          fi
 
           # Apply labels based on hostname pattern
           if [[ "$HOSTNAME" =~ ^vausk[0-9]+$ ]]; then

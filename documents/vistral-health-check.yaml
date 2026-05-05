@@ -23,6 +23,14 @@ parameters:
     type: String
     description: "AWS region"
     default: "us-east-1"
+  NasServerIp:
+    type: String
+    description: "NAS server IP (passed by vistral-node-buildout from /vistral/infrastructure/nas-server-ip)"
+    default: ""
+  NasBasePath:
+    type: String
+    description: "NAS base path (informational only)"
+    default: ""
 
 mainSteps:
   - action: aws:runShellScript
@@ -81,10 +89,15 @@ mainSteps:
           check "External DNS (google.com)" nslookup google.com
           warn_check "Vistral DNS (cvat.vistral.dev)" nslookup cvat.vistral.dev
 
-          # NFS accessibility
-          NAS_IP="192.168.1.201"
-          check "NFS server reachable ($NAS_IP)" ping -c 1 -W 2 "$NAS_IP"
-          warn_check "NFS port open" bash -c "echo > /dev/tcp/$NAS_IP/2049" 2>/dev/null
+          # NFS accessibility — server IP injected from SSM via doc parameter.
+          NAS_IP="{{NasServerIp}}"
+          if [ -n "$NAS_IP" ]; then
+              check "NFS server reachable ($NAS_IP)" ping -c 1 -W 2 "$NAS_IP"
+              warn_check "NFS port open" bash -c "echo > /dev/tcp/$NAS_IP/2049" 2>/dev/null
+          else
+              echo "  [WARN] NFS check skipped — NasServerIp parameter not provided"
+              ((WARN++))
+          fi
 
           # Disk space
           ROOT_USE=$(df / | tail -1 | awk '{print $5}' | tr -d '%')

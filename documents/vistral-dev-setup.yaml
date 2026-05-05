@@ -7,7 +7,7 @@ description: |
   so dev nodes are fully provisioned before K8s steps (which they skip).
 
   Installs:
-  1. Docker daemon + insecure registry config for NAS (192.168.1.201:9500)
+  1. Docker daemon + insecure registry config for NAS (registry from /vistral/registry/endpoint)
   2. NVIDIA driver-550 + nvidia-container-toolkit
   3. NFS client + mounts for models/input/output
   4. Dev tools (git, build-essential, python3-venv, jq, htop, tmux)
@@ -19,6 +19,18 @@ parameters:
     type: String
     description: "AWS region"
     default: "us-east-1"
+  NasServerIp:
+    type: String
+    description: "NAS server IP (passed by vistral-node-buildout from /vistral/infrastructure/nas-server-ip)"
+    default: ""
+  NasBasePath:
+    type: String
+    description: "NAS base export path (e.g. /volume1/vistral-share/Vistral/vision-ai)"
+    default: ""
+  ContainerRegistry:
+    type: String
+    description: "Container registry endpoint host:port (from /vistral/registry/endpoint)"
+    default: ""
 
 mainSteps:
   - action: aws:runShellScript
@@ -39,6 +51,20 @@ mainSteps:
 
           HOSTNAME=$(hostname | tr '[:upper:]' '[:lower:]')
           echo "Hostname: $HOSTNAME"
+
+          # Configuration sourced from /vistral/* via document parameters
+          # (passed by vistral-node-buildout). Fail fast if any are missing —
+          # P1 #5: never silently fall back to a stale hardcoded value.
+          NAS_IP="{{NasServerIp}}"
+          NFS_FULL_PATH="{{NasBasePath}}"
+          CONTAINER_REGISTRY="{{ContainerRegistry}}"
+          # NAS exports the parent share, not the per-project subdir. Trim
+          # /Vistral/vision-ai (or whatever sub-path) down to /volume1/vistral-share.
+          if [[ -z "$NAS_IP" || -z "$NFS_FULL_PATH" || -z "$CONTAINER_REGISTRY" ]]; then
+              echo "FATAL: missing one of NAS_IP / NFS_FULL_PATH / CONTAINER_REGISTRY. Verify SSM Parameter Store /vistral/* and that vistral-node-buildout passes them."
+              exit 1
+          fi
+          NFS_SHARE="/$(echo "$NFS_FULL_PATH" | awk -F/ '{print $2"/"$3}')"
 
           # Guard: only run on dev nodes
           if [[ ! "$HOSTNAME" =~ ^vausd[0-9]+$ ]]; then
@@ -79,10 +105,10 @@ mainSteps:
 
           # Configure insecure registry for NAS
           DAEMON_JSON="/etc/docker/daemon.json"
-          if [ ! -f "$DAEMON_JSON" ] || ! grep -q "192.168.1.201:9500" "$DAEMON_JSON" 2>/dev/null; then
-              cat > "$DAEMON_JSON" <<'DOCKER_EOF'
+          if [ ! -f "$DAEMON_JSON" ] || ! grep -q "${CONTAINER_REGISTRY}" "$DAEMON_JSON" 2>/dev/null; then
+              cat > "$DAEMON_JSON" <<DOCKER_EOF
           {
-              "insecure-registries": ["192.168.1.201:9500"],
+              "insecure-registries": ["${CONTAINER_REGISTRY}"],
               "log-driver": "json-file",
               "log-opts": {
                   "max-size": "100m",
@@ -91,7 +117,7 @@ mainSteps:
           }
           DOCKER_EOF
               systemctl restart docker
-              echo "Docker daemon configured with insecure registry"
+              echo "Docker daemon configured with insecure registry ${CONTAINER_REGISTRY}"
           else
               echo "Docker daemon already configured"
           fi
@@ -170,10 +196,10 @@ mainSteps:
               apt-get install -y nfs-common
           fi
 
-          NAS_IP="192.168.1.201"
-          NFS_SHARE="/volume1/vistral-share"
+          # NAS_IP and NFS_SHARE were derived above from the {{NasServerIp}} +
+          # {{NasBasePath}} document parameters — single source of truth in SSM.
 
-          # The NAS exports a single share (/volume1/vistral-share).
+          # The NAS exports a single share ($NFS_SHARE).
           # Mount the root share, then create convenience symlinks for
           # deepstream paths so containers can mount /mnt/nfs/deepstream/*.
           mkdir -p /mnt/nfs/vistral-share
@@ -210,12 +236,12 @@ mainSteps:
 
           printf '%s\n' \
             "[Unit]" \
-            "Description=NFS mount for vistral-share (192.168.1.201)" \
+            "Description=NFS mount for vistral-share (${NAS_IP})" \
             "After=network-online.target" \
             "Wants=network-online.target" \
             "" \
             "[Mount]" \
-            "What=192.168.1.201:/volume1/vistral-share" \
+            "What=${NAS_IP}:${NFS_SHARE}" \
             "Where=/mnt/nfs/vistral-share" \
             "Type=nfs" \
             "Options=defaults,_netdev,soft,timeo=150,retrans=3" \

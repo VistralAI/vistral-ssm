@@ -41,8 +41,20 @@ parameters:
     default: "vistral-k8s-join-token"
   VipAddress:
     type: String
-    description: "Virtual IP address for the Kubernetes API"
-    default: "192.168.1.204"
+    description: "Virtual IP for the K8s API. Source-of-truth: SSM /vistral/k8s/vip-address (passed by State Manager Association)."
+    default: ""
+  NasServerIp:
+    type: String
+    description: "NAS server IP. Source-of-truth: SSM /vistral/infrastructure/nas-server-ip."
+    default: ""
+  NasBasePath:
+    type: String
+    description: "NAS base export path. Source-of-truth: SSM /vistral/infrastructure/nas-base-path."
+    default: ""
+  ContainerRegistry:
+    type: String
+    description: "Container registry endpoint (host:port). Source-of-truth: SSM /vistral/registry/endpoint."
+    default: ""
   GitHubRepo:
     type: String
     description: "GitHub repository URL (SSH format)"
@@ -94,6 +106,15 @@ mainSteps:
       DocumentName: vistral-dev-setup
       InstanceIds:
         - "{{InstanceId}}"
+      Parameters:
+        NasServerIp:
+          - "{{NasServerIp}}"
+        NasBasePath:
+          - "{{NasBasePath}}"
+        ContainerRegistry:
+          - "{{ContainerRegistry}}"
+        AWSRegion:
+          - "{{AWSRegion}}"
       CloudWatchOutputConfig:
         CloudWatchLogGroupName: /aws/ssm/vistral-buildout
         CloudWatchOutputEnabled: true
@@ -237,6 +258,10 @@ mainSteps:
       InstanceIds:
         - "{{InstanceId}}"
       Parameters:
+        NasServerIp:
+          - "{{NasServerIp}}"
+        NasBasePath:
+          - "{{NasBasePath}}"
         AWSRegion:
           - "{{AWSRegion}}"
       CloudWatchOutputConfig:

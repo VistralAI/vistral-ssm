@@ -1,0 +1,19 @@
+{
+  "name": "@vistral/ssm-documents",
+  "version": "0.1.0",
+  "description": "SSM document definitions and shared bash libraries for Vistral cluster buildout",
+  "main": "lib/index.js",
+  "types": "lib/index.d.ts",
+  "files": [
+    "documents/",
+    "lib/"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "prepare": "tsc"
+  },
+  "devDependencies": {
+    "@types/node": "^20.10.0",
+    "typescript": "~5.3.0"
+  }
+}

@@ -22,8 +22,8 @@ parameters:
     default: "vistral-k8s-join-token"
   VipAddress:
     type: String
-    description: "Virtual IP address for the Kubernetes API"
-    default: "192.168.1.204"
+    description: "Virtual IP for K8s API. Source-of-truth: SSM /vistral/k8s/vip-address (passed by vistral-node-buildout)."
+    default: ""
   GitHubRepo:
     type: String
     description: "GitHub repository URL (SSH format)"
@@ -112,10 +112,25 @@ mainSteps:
                   fi
               fi
 
-              # Check 4: Are certs expired?
+              # Check 4: Are certs expired or expiring within 7 days?
+              # P1 #6: proactive rotation — `-checkend 0` only fires on already-
+              # dead certs, so a node that's seen at the wrong moment can pass
+              # this guard and then break ten minutes later when the cert dies
+              # mid-buildout. 7-day threshold gives State Manager's daily cron
+              # multiple shots at rotating before expiry.
+              CERT_MIN_SECONDS=604800   # 7 days
               if [ "$NEEDS_RESET" = "false" ] && [ -f /etc/kubernetes/pki/apiserver.crt ]; then
-                  if ! openssl x509 -in /etc/kubernetes/pki/apiserver.crt -noout -checkend 0 2>/dev/null; then
-                      echo "API server certificate is expired"
+                  if ! openssl x509 -in /etc/kubernetes/pki/apiserver.crt -noout -checkend "$CERT_MIN_SECONDS" 2>/dev/null; then
+                      echo "API server certificate expires within ${CERT_MIN_SECONDS}s — forcing rotation"
+                      NEEDS_RESET=true
+                  fi
+              fi
+              # Check 4b: kubelet client cert (auto-rotated by kubelet, but if
+              # the rotation has stalled the symlink can point to an expiring cert).
+              KUBELET_CLIENT_CERT=/var/lib/kubelet/pki/kubelet-client-current.pem
+              if [ "$NEEDS_RESET" = "false" ] && [ -e "$KUBELET_CLIENT_CERT" ]; then
+                  if ! openssl x509 -in "$KUBELET_CLIENT_CERT" -noout -checkend "$CERT_MIN_SECONDS" 2>/dev/null; then
+                      echo "kubelet client cert expires within ${CERT_MIN_SECONDS}s — rotation has stalled"
                       NEEDS_RESET=true
                   fi
               fi

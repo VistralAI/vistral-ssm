@@ -42,10 +42,23 @@ mainSteps:
               echo "LVM extended successfully." || \
               echo "LVM extend skipped (no free space or not an LVM setup)."
 
-          # Guard: skip if T2 kernel already installed
+          # P1 #6 hardened guard: kernel package installed ≠ booted on T2
+          # kernel ≠ T2 modules functional. dpkg-installed but not the
+          # currently-running kernel means a reboot is pending; module load
+          # failures mean reinstall is needed. Require all three conditions.
           if dpkg -l | grep -q "linux-t2-lts"; then
-              echo "T2 kernel already installed. Skipping."
-              exit 0
+              # L2: are we booted on a T2 kernel?
+              RUNNING_KERNEL="$(uname -r)"
+              if echo "$RUNNING_KERNEL" | grep -qE 't2|apple'; then
+                  # L3: T2 audio module loaded (proxy for T2-aware drivers)
+                  if lsmod | grep -qE '^snd_hda_apple|^applespi'; then
+                      echo "T2 kernel installed, running, modules loaded. Skipping."
+                      exit 0
+                  fi
+                  echo "T2 kernel running but expected modules not loaded — reinstalling."
+              else
+                  echo "T2 kernel installed but running stock kernel ($RUNNING_KERNEL) — reboot required, will be triggered post-install."
+              fi
           fi
 
           # Detect T2 hardware
