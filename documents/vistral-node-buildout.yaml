@@ -155,9 +155,11 @@ mainSteps:
         CloudWatchOutputEnabled: true
 
   # Step 4: Label and taint the node
+  # Abort + retry: wrong labels = wrong scheduling = silent capacity loss
   - name: nodeLabel
     action: aws:runCommand
-    onFailure: Continue
+    onFailure: Abort
+    maxAttempts: 2
     timeoutSeconds: 300
     inputs:
       DocumentName: vistral-node-label
@@ -203,9 +205,12 @@ mainSteps:
         CloudWatchOutputEnabled: true
 
   # Step 7: Platform deployment (only runs on vausk01, skips elsewhere)
+  # Abort + retry: Helm partial-deploy is the worst possible state. Document
+  # itself exit-0's on non-vausk01 nodes, so Abort only triggers on real failures.
   - name: platformDeploy
     action: aws:runCommand
-    onFailure: Continue
+    onFailure: Abort
+    maxAttempts: 2
     timeoutSeconds: 1800
     inputs:
       DocumentName: vistral-platform-deploy
