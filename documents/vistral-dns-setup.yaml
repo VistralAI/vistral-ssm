@@ -1,0 +1,20 @@
+schemaVersion: "2.2"
+description: |
+  No-op stub. Vistral DNS is now configured by vistral-cluster's
+  setup-keepalived.sh / coredns service on control-plane nodes; this
+  SSM document is retained only to satisfy CloudFormation's
+  AWS::EarlyValidation::ResourceExistenceCheck hook, which blocked
+  removal of the original document on 2026-05-05.
+
+  When the upstream hook is investigated and a clean removal path is
+  documented, this stub can be deleted along with the CDK construct
+  (which carries removalPolicy: RETAIN so CFN won't try to delete the
+  AWS resource even after the construct is removed).
+parameters: {}
+mainSteps:
+  - action: aws:runShellScript
+    name: noop
+    inputs:
+      runCommand:
+        - 'echo "vistral-dns-setup is a no-op stub; DNS is configured by vistral-cluster scripts and CoreDNS"'
+        - 'exit 0'
