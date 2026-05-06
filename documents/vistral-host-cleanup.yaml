@@ -75,26 +75,40 @@ mainSteps:
           apt-mark showhold || true
 
           # ---------- 2. Disable legacy host coredns ----------
+          # Templated systemd units (coredns@primary, coredns@secondary)
+          # don't show in `list-unit-files` (that only lists templates).
+          # Use `is-active` / `is-enabled` to detect running instances.
+          # The template itself (`coredns@.service`) is also masked so
+          # nothing can re-spawn instances on next boot.
           for instance in primary secondary; do
             unit="coredns@${instance}.service"
-            if systemctl list-unit-files "$unit" 2>/dev/null | grep -q "$unit"; then
-              if systemctl is-enabled "$unit" 2>/dev/null | grep -qE "enabled|alias"; then
-                echo "Disabling $unit (legacy host CoreDNS — kubelet has its own)"
-                systemctl disable --now "$unit" || true
-              fi
-              # Mask so it can never re-enable accidentally on next reboot
-              if ! systemctl is-enabled "$unit" 2>/dev/null | grep -q masked; then
-                echo "Masking $unit"
-                systemctl mask "$unit" || true
-              fi
-            else
-              echo "$unit not present — nothing to disable"
+            active="$(systemctl is-active "$unit" 2>/dev/null || true)"
+            enabled="$(systemctl is-enabled "$unit" 2>/dev/null || true)"
+            if [[ "$active" == "active" || "$active" == "activating" ]]; then
+              echo "Stopping $unit (was $active; legacy host CoreDNS)"
+              systemctl stop "$unit" || true
+            fi
+            if [[ "$enabled" =~ ^(enabled|alias|enabled-runtime)$ ]]; then
+              echo "Disabling $unit (was $enabled)"
+              systemctl disable "$unit" || true
+            fi
+            if [[ "$enabled" != "masked" && "$active" != "inactive" ]] || systemctl is-active --quiet "$unit"; then
+              echo "Masking $unit so it can't re-spawn"
+              systemctl mask "$unit" 2>/dev/null || true
             fi
           done
 
-          # Also clean up the leftover /etc/coredns/ dir if both instances
-          # are gone (purely cosmetic — frees ~50KB).
-          if ! systemctl list-unit-files 'coredns@*.service' 2>/dev/null | grep -qE "coredns@.*\s+(enabled|alias)"; then
+          # Also mask the template itself so future enables can't spawn instances.
+          if systemctl list-unit-files coredns@.service 2>/dev/null | grep -qE "coredns@\.service"; then
+            tmpl_state="$(systemctl is-enabled coredns@.service 2>/dev/null || true)"
+            if [[ "$tmpl_state" != "masked" ]]; then
+              echo "Masking coredns@.service template"
+              systemctl mask coredns@.service 2>/dev/null || true
+            fi
+          fi
+
+          # Clean up the leftover /etc/coredns/ dir once nothing references it.
+          if ! systemctl is-active --quiet 'coredns@*.service' 2>/dev/null; then
             if [[ -d /etc/coredns ]]; then
               echo "Removing orphaned /etc/coredns directory"
               rm -rf /etc/coredns
