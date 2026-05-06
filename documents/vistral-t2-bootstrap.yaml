@@ -46,12 +46,29 @@ mainSteps:
           # kernel ≠ T2 modules functional. dpkg-installed but not the
           # currently-running kernel means a reboot is pending; module load
           # failures mean reinstall is needed. Require all three conditions.
+          #
+          # 2026-05-06 incident root cause: the L3 module check originally
+          # used `snd_hda_apple|applespi` as the proxy for "T2 modules
+          # loaded". Both modules only load on Macs with a *built-in*
+          # keyboard / built-in MacBook audio (MacBookAir, MacBookPro,
+          # iMac). On Mac mini (Macmini8,1) neither module ever loads
+          # because the hardware doesn't exist. Result: every 30 min,
+          # SSM State Manager re-ran this script on vausk01 (Mac mini),
+          # the L3 check failed, "reinstall + reboot" path fired, and
+          # vausk01 looped: 10 min uptime → reinstall → reboot → repeat.
+          # Fix: use `apple_bce` (the T2 PCIe bridge driver) as the
+          # universal T2 module — loads on Mac mini, MacBook, iMac, and
+          # MacPro alike. Fall back to `apple_smc` if `apple_bce` is
+          # absent (older T2 kernels). Both must be missing before we
+          # trigger a reinstall.
           if dpkg -l | grep -q "linux-t2-lts"; then
               # L2: are we booted on a T2 kernel?
               RUNNING_KERNEL="$(uname -r)"
               if echo "$RUNNING_KERNEL" | grep -qE 't2|apple'; then
-                  # L3: T2 audio module loaded (proxy for T2-aware drivers)
-                  if lsmod | grep -qE '^snd_hda_apple|^applespi'; then
+                  # L3: a T2-specific kernel module is loaded. apple_bce
+                  # is the T2 PCIe bridge present on every T2 Mac model;
+                  # apple_smc is the legacy fallback.
+                  if lsmod | grep -qE '^apple_bce|^apple_smc'; then
                       echo "T2 kernel installed, running, modules loaded. Skipping."
                       exit 0
                   fi
