@@ -1,0 +1,7 @@
+schemaVersion: "9.9"
+description: "Negative fixture: unsupported schemaVersion"
+mainSteps:
+  - name: ok
+    action: aws:runCommand
+    inputs:
+      DocumentName: AWS-RunShellScript

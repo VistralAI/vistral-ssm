@@ -1,0 +1,80 @@
+name: Validate
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  schema:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install check-jsonschema
+        run: pip install check-jsonschema
+
+      - name: Validate every SSM document
+        # SSM documents are interpreted server-side — a malformed doc deploys
+        # successfully and only fails when a node tries to execute it. This
+        # gate catches bad onFailure values, missing required fields, and
+        # unsupported schemaVersion before the deploy ever happens.
+        run: |
+          check-jsonschema \
+            --schemafile schemas/ssm-document.schema.json \
+            documents/*.yaml
+
+      - name: Confirm schema rejects bad fixtures
+        # The schema is only useful if it actually rejects bad input. Run the
+        # negative fixtures and assert each one fails. If any pass, the
+        # schema has regressed.
+        run: |
+          for f in schemas/test-fixtures/*.yaml; do
+            echo "Validating (must FAIL): $f"
+            if check-jsonschema --schemafile schemas/ssm-document.schema.json "$f" 2>/dev/null; then
+              echo "FAIL: $f passed schema validation but should have been rejected"
+              exit 1
+            else
+              echo "  ✓ correctly rejected"
+            fi
+          done
+
+  typescript:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: TypeScript strict type-check
+        run: npx tsc --noEmit
+
+      - name: Build (verifies the package consumers will resolve)
+        run: npm run build
+
+  bash:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install shellcheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y shellcheck
+
+      - name: shellcheck bash/
+        run: |
+          if [ -d bash ] && ls bash/*.sh >/dev/null 2>&1; then
+            shellcheck --severity=error bash/*.sh
+          else
+            echo "No bash/ scripts; skipping."
+          fi

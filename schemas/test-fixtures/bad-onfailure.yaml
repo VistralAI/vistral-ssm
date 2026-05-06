@@ -1,0 +1,8 @@
+schemaVersion: "0.3"
+description: "Negative fixture: onFailure must be Abort, Continue, or step:<name>"
+mainSteps:
+  - name: badStep
+    action: aws:runCommand
+    onFailure: Maybe
+    inputs:
+      DocumentName: AWS-RunShellScript

@@ -1,0 +1,6 @@
+schemaVersion: "2.2"
+description: "Negative fixture: step is missing required `action` field"
+mainSteps:
+  - name: oops
+    inputs:
+      runCommand: ["echo hi"]

@@ -1,0 +1,81 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://vistral.dev/schemas/ssm-document.schema.json",
+  "title": "AWS SSM Document",
+  "description": "Subset schema covering the shapes used by vistral-ssm/documents. Catches the most common authoring mistakes (wrong onFailure values, missing required fields, malformed parameters) without trying to be exhaustive about every AWS-supported action.",
+  "type": "object",
+  "required": ["schemaVersion"],
+  "properties": {
+    "schemaVersion": {
+      "type": "string",
+      "enum": ["0.3", "1.2", "2.0", "2.2"]
+    },
+    "description": { "type": "string" },
+    "assumeRole": { "type": "string" },
+    "parameters": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "required": ["type"],
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": ["String", "StringList", "Boolean", "Integer", "MapList", "StringMap"]
+          },
+          "description": { "type": "string" },
+          "default": {},
+          "allowedValues": { "type": "array" },
+          "allowedPattern": { "type": "string" },
+          "displayType": { "type": "string", "enum": ["textfield", "textarea"] },
+          "minChars": { "type": "integer", "minimum": 0 },
+          "maxChars": { "type": "integer", "minimum": 0 }
+        },
+        "additionalProperties": false
+      }
+    },
+    "mainSteps": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/Step" }
+    },
+    "outputs": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "files": { "type": "object" }
+  },
+  "$defs": {
+    "Step": {
+      "type": "object",
+      "required": ["action", "name"],
+      "properties": {
+        "action": {
+          "type": "string",
+          "pattern": "^aws:"
+        },
+        "name": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_-]+$"
+        },
+        "description": { "type": "string" },
+        "onFailure": {
+          "oneOf": [
+            { "type": "string", "enum": ["Abort", "Continue"] },
+            { "type": "string", "pattern": "^step:" }
+          ]
+        },
+        "onSuccess": { "type": "string" },
+        "onCancel": { "type": "string" },
+        "nextStep": { "type": "string" },
+        "isCritical": { "type": ["boolean", "string"] },
+        "isEnd": { "type": ["boolean", "string"] },
+        "maxAttempts": { "type": "integer", "minimum": 1 },
+        "timeoutSeconds": { "type": "integer", "minimum": 1 },
+        "inputs": { "type": "object" },
+        "precondition": { "type": "object" },
+        "outputs": { "type": "array" }
+      },
+      "additionalProperties": false
+    }
+  }
+}
