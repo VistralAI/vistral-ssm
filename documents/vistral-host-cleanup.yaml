@@ -1,0 +1,120 @@
+schemaVersion: "2.2"
+description: |
+  Idempotent host cleanup for existing cluster nodes.
+
+  - Holds kernel meta-packages (linux-image-*, linux-headers-*, and the
+    Ubuntu version-specific meta linux-generic-* / linux-t2-lts) so
+    unattended-upgrades can't drift the kernel out from under the cluster.
+    Mirrors the apt-mark hold the autoinstall templates apply at provision
+    time (vistral-bootstrap commit b764e2b, 2026-05-06) — closes the gap
+    for nodes that were provisioned before that change.
+  - Disables + masks legacy `coredns@primary.service` and
+    `coredns@secondary.service` units that were installed by the now-
+    archived `vistral-dns-cluster` repo. They fight kubelet's in-cluster
+    coredns pod for port 53 and crashloop hundreds of times an hour
+    (observed 318 restarts in 10 min on vausk01, 2026-05-06).
+  - Disables + masks `wol-enable.service` if it failed to start (legacy
+    bug from before vistral-wol-setup commit fixing the unit-file
+    template). The replacement service from vistral-wol-setup will be
+    regenerated cleanly on the next run.
+
+  Idempotent: safe to run repeatedly. Each step short-circuits if state
+  is already correct.
+
+parameters:
+  AWSRegion:
+    type: String
+    description: "AWS region"
+    default: "us-east-1"
+
+mainSteps:
+  - action: aws:runShellScript
+    name: hostCleanup
+    inputs:
+      timeoutSeconds: 300
+      runCommand:
+        - |
+          #!/bin/bash
+          set -e
+
+          LOG="/var/log/vistral-host-cleanup.log"
+          exec > >(tee -a "$LOG") 2>&1
+
+          echo "=========================================="
+          echo "Vistral Host Cleanup - $(date)"
+          echo "=========================================="
+
+          # ---------- 1. Hold kernel meta-packages ----------
+          # apt-mark holds are idempotent (re-holding is a no-op). Match
+          # whichever meta-package the install picked.
+          KERNEL_PKGS=()
+          for pkg in linux-generic linux-generic-hwe-22.04 linux-t2-lts \
+                     linux-image-generic linux-headers-generic; do
+            if dpkg -l "$pkg" 2>/dev/null | grep -qE "^ii\s+$pkg\s"; then
+              KERNEL_PKGS+=("$pkg")
+            fi
+          done
+          if [[ ${#KERNEL_PKGS[@]} -gt 0 ]]; then
+            echo "Holding kernel meta-packages: ${KERNEL_PKGS[*]}"
+            apt-mark hold "${KERNEL_PKGS[@]}" || true
+          else
+            echo "No kernel meta-packages found to hold (unusual; skipping)"
+          fi
+
+          # Also hold any installed nvidia driver packages on GPU nodes.
+          NVIDIA_PKGS=()
+          for pkg in $(dpkg -l 2>/dev/null | awk '/^ii\s+(nvidia-driver-[0-9]+|nvidia-dkms-[0-9]+)\s/ {print $2}'); do
+            NVIDIA_PKGS+=("$pkg")
+          done
+          if [[ ${#NVIDIA_PKGS[@]} -gt 0 ]]; then
+            echo "Holding nvidia driver packages: ${NVIDIA_PKGS[*]}"
+            apt-mark hold "${NVIDIA_PKGS[@]}" || true
+          fi
+
+          echo "Current apt-mark holds:"
+          apt-mark showhold || true
+
+          # ---------- 2. Disable legacy host coredns ----------
+          for instance in primary secondary; do
+            unit="coredns@${instance}.service"
+            if systemctl list-unit-files "$unit" 2>/dev/null | grep -q "$unit"; then
+              if systemctl is-enabled "$unit" 2>/dev/null | grep -qE "enabled|alias"; then
+                echo "Disabling $unit (legacy host CoreDNS — kubelet has its own)"
+                systemctl disable --now "$unit" || true
+              fi
+              # Mask so it can never re-enable accidentally on next reboot
+              if ! systemctl is-enabled "$unit" 2>/dev/null | grep -q masked; then
+                echo "Masking $unit"
+                systemctl mask "$unit" || true
+              fi
+            else
+              echo "$unit not present — nothing to disable"
+            fi
+          done
+
+          # Also clean up the leftover /etc/coredns/ dir if both instances
+          # are gone (purely cosmetic — frees ~50KB).
+          if ! systemctl list-unit-files 'coredns@*.service' 2>/dev/null | grep -qE "coredns@.*\s+(enabled|alias)"; then
+            if [[ -d /etc/coredns ]]; then
+              echo "Removing orphaned /etc/coredns directory"
+              rm -rf /etc/coredns
+            fi
+          fi
+
+          # ---------- 3. Disable failed wol-enable.service ----------
+          # The original unit file (pre vistral-wol-setup fix) had a
+          # malformed ethtool command (RemainAfterExit concatenated into
+          # the ethtool arg). It fails on every boot. The corrected
+          # vistral-wol-setup doc will regenerate it cleanly when next
+          # invoked; until then, mask the broken one to stop the
+          # systemd "Failed to start" noise.
+          if systemctl is-failed wol-enable.service 2>/dev/null | grep -q failed; then
+            echo "Disabling failed wol-enable.service (will be regenerated by vistral-wol-setup)"
+            systemctl disable wol-enable.service || true
+            systemctl mask wol-enable.service || true
+          fi
+
+          echo "=========================================="
+          echo "Host cleanup complete - $(date)"
+          echo "=========================================="
+          exit 0

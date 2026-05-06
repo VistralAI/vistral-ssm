@@ -142,7 +142,8 @@ mainSteps:
 
           [Service]
           Type=oneshot
-          $(echo -e "$EXEC_LINES")RemainAfterExit=yes
+          $(echo -e "$EXEC_LINES")
+          RemainAfterExit=yes
 
           [Install]
           WantedBy=multi-user.target
