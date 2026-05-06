@@ -104,7 +104,44 @@ mainSteps:
               if [ "$NEEDS_RESET" = "false" ]; then
                   NODE_STATUS=$(kubectl get node "$HOSTNAME" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || echo "Unknown")
                   if [ "$NODE_STATUS" = "True" ]; then
-                      echo "Node is healthy and Ready. Skipping auto-join."
+                      echo "Node is healthy and Ready. Refreshing /opt/vistral-cluster before exit."
+
+                      # Refresh the on-disk cluster repo so node-side scripts
+                      # (preamble.sh, finalize.sh, etc.) match origin/main
+                      # without needing a full reset+rejoin. Previously this
+                      # branch exited early and left stale clones — that's
+                      # how the P1 #8 metric path silently broke for weeks
+                      # after the URL fix shipped.
+                      apt-get update -qq && apt-get install -y -qq git curl unzip jq 2>&1 || true
+                      if ! command -v aws &>/dev/null; then
+                          cd /tmp
+                          curl -sL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o awscliv2.zip
+                          unzip -q awscliv2.zip
+                          ./aws/install --update >/dev/null 2>&1 || true
+                          rm -rf awscliv2.zip aws
+                          cd -
+                      fi
+                      DEPLOY_KEY=$(aws secretsmanager get-secret-value \
+                          --secret-id "$DEPLOY_KEY_SECRET" \
+                          --region "$AWS_REGION" \
+                          --query SecretString --output text 2>/dev/null || echo "")
+                      if [ -n "$DEPLOY_KEY" ]; then
+                          mkdir -p ~/.ssh
+                          echo "$DEPLOY_KEY" > ~/.ssh/github_deploy
+                          chmod 600 ~/.ssh/github_deploy
+                          ssh-keyscan github.com >> ~/.ssh/known_hosts 2>/dev/null
+                          export GIT_SSH_COMMAND="ssh -i ~/.ssh/github_deploy -o StrictHostKeyChecking=no"
+                          rm -rf /opt/vistral-cluster
+                          if git clone "$GITHUB_REPO" /opt/vistral-cluster 2>&1; then
+                              chmod +x /opt/vistral-cluster/*.sh /opt/vistral-cluster/scripts/*.sh 2>/dev/null || true
+                              echo "Refreshed /opt/vistral-cluster to $(git -C /opt/vistral-cluster log -1 --format='%h %s')"
+                          else
+                              echo "WARN: refresh failed — leaving any prior clone untouched"
+                          fi
+                          rm -f ~/.ssh/github_deploy
+                      else
+                          echo "WARN: deploy key unavailable; skipping repo refresh"
+                      fi
                       exit 0
                   else
                       echo "Node exists but status is: Ready=$NODE_STATUS"
