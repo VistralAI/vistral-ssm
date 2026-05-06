@@ -161,27 +161,43 @@ mainSteps:
 
           # =========================================================
           # Step 3+4: Patch the apiserver static-pod manifest.
-          # kubelet watches this file and recreates the apiserver pod
-          # when its mtime changes — no kubelet restart needed.
+          #
+          # IMPORTANT: kubelet's static-pod manager doesn't always re-read
+          # a manifest that's modified in place. Observed 2026-05-06 on
+          # vausk01: sed-then-python double-write produced the right file
+          # on disk but kubelet kept the original cached pod spec, so the
+          # apiserver came back WITHOUT --encryption-provider-config even
+          # though the manifest had it. The reliable way to force kubelet
+          # to re-read is to MOVE the manifest out of /etc/kubernetes/manifests/
+          # entirely (kubelet tears down the pod), then move it back
+          # (kubelet reads the new file fresh).
+          #
+          # During the move-aside window, this node's apiserver is down.
+          # That's why operators run this doc against ONE control plane
+          # at a time — the LB routes traffic to the other two healthy
+          # CPs while we rotate.
           # =========================================================
           if ! grep -q 'encryption-provider-config' "$MANIFEST"; then
               BACKUP="${MANIFEST}.pre-encryption.$(date +%Y%m%d-%H%M%S)"
               cp "$MANIFEST" "$BACKUP"
               echo "Backed up manifest → $BACKUP"
 
-              # Insert --encryption-provider-config flag after the
-              # `- kube-apiserver` command line. Indent matches the
-              # existing flags (4 spaces, '- '). Idempotency is enforced
-              # by the grep guard above, so this only runs on first edit.
+              # Build the patched manifest in a staging file outside the
+              # static-pod path so kubelet never sees an intermediate
+              # state. Two edits:
+              #   1. sed inserts --encryption-provider-config after the
+              #      `- kube-apiserver` command line.
+              #   2. python+pyyaml adds the encryption-config hostPath
+              #      volume + container volumeMount. yaml-aware so we
+              #      don't risk indentation bugs.
+              STAGE=/tmp/kube-apiserver.yaml.new.$$
+              cp "$BACKUP" "$STAGE"
+
               sed -i \
                 '/- kube-apiserver$/a\    - --encryption-provider-config=/etc/kubernetes/encryption/config.yaml' \
-                "$MANIFEST"
+                "$STAGE"
 
-              # Add the volume + volumeMount via Python (yaml-aware) so
-              # we don't risk indentation bugs from a sed regex on YAML.
-              # Python3 + PyYAML are present on every control plane (kubelet
-              # depends on them transitively via cloud-init / Ubuntu base).
-              python3 - "$MANIFEST" <<'PY'
+              python3 - "$STAGE" <<'PY'
           import sys, yaml, io
           path = sys.argv[1]
           with open(path) as f:
@@ -205,37 +221,73 @@ mainSteps:
           with open(path, "w") as f:
               f.write(buf.getvalue())
           PY
-              echo "Patched $MANIFEST (flag + volume mount)"
+              echo "Built patched manifest at $STAGE"
+
+              # Now the rotate: move original aside, wait for kubelet to
+              # tear down the apiserver pod, then move the patched
+              # manifest into place. Kubelet reads the new file fresh.
+              MANIFEST_AWAY=/tmp/kube-apiserver.yaml.away.$$
+              mv "$MANIFEST" "$MANIFEST_AWAY"
+              echo "Moved manifest aside; waiting for kubelet to tear down old apiserver pod..."
+              for i in $(seq 1 60); do
+                  if ! crictl ps -q --label io.kubernetes.container.name=kube-apiserver \
+                       2>/dev/null | grep -q .; then
+                      echo "Old apiserver container gone after ${i}*5s"
+                      break
+                  fi
+                  sleep 5
+              done
+
+              mv "$STAGE" "$MANIFEST"
+              echo "Moved patched manifest into place; waiting for new apiserver to start with encryption..."
           else
               echo "$MANIFEST already references encryption-provider-config — skipping patch"
           fi
 
           # =========================================================
-          # Step 5: Wait for kube-apiserver pod on THIS node to come back
-          # Ready. kubelet usually recreates it within 30s of the
-          # manifest mtime change.
+          # Step 5: Wait for kube-apiserver container on THIS node to be
+          # running with the --encryption-provider-config flag actually
+          # in argv. The previous version checked for "any apiserver pod
+          # Ready" which can match the OLD non-encrypted pod when the
+          # readiness probe is fast. This check is on the live container,
+          # not on a kubectl status that may be stale.
           # =========================================================
-          NODE=$(hostname | tr '[:upper:]' '[:lower:]')
-          echo "Waiting up to 5 min for kube-apiserver on $NODE to become Ready..."
+          echo "Waiting up to 5 min for kube-apiserver on $(hostname) to come up with encryption..."
           DEADLINE=$(( $(date +%s) + 300 ))
           while [ "$(date +%s)" -lt "$DEADLINE" ]; do
-              if kubectl --kubeconfig="$KUBECONFIG" \
-                   -n kube-system get pod \
-                   -l component=kube-apiserver \
-                   --field-selector=spec.nodeName="$NODE" \
-                   -o jsonpath='{.items[*].status.conditions[?(@.type=="Ready")].status}' 2>/dev/null \
-                   | grep -q True; then
-                  echo "kube-apiserver on $NODE is Ready."
-                  break
+              CID=$(crictl ps -q --label io.kubernetes.container.name=kube-apiserver \
+                    2>/dev/null | head -1)
+              if [ -n "$CID" ]; then
+                  if crictl inspect "$CID" 2>/dev/null \
+                       | grep -q '"--encryption-provider-config'; then
+                      echo "kube-apiserver running with encryption flag (container $CID)."
+                      break
+                  fi
               fi
               sleep 5
           done
           if [ "$(date +%s)" -ge "$DEADLINE" ]; then
-              echo "ERROR: apiserver did not come back Ready within 5 min."
-              echo "Check: kubectl describe pod -n kube-system -l component=kube-apiserver"
+              echo "ERROR: apiserver did not come back with encryption flag within 5 min."
+              echo "Check: crictl ps + crictl logs"
               echo "Manifest backup at ${MANIFEST}.pre-encryption.* — restore if needed."
               exit 1
           fi
+
+          # Now wait until that container also reports Ready, so the
+          # operator can move on to the next CP without a quiet partial
+          # outage.
+          echo "Waiting for /readyz on local apiserver..."
+          DEADLINE=$(( $(date +%s) + 180 ))
+          while [ "$(date +%s)" -lt "$DEADLINE" ]; do
+              if curl -sk --max-time 5 https://127.0.0.1:6443/readyz \
+                   --cert /etc/kubernetes/pki/apiserver-kubelet-client.crt \
+                   --key /etc/kubernetes/pki/apiserver-kubelet-client.key \
+                   2>/dev/null | grep -q '^ok$'; then
+                  echo "Local apiserver readyz=ok."
+                  break
+              fi
+              sleep 3
+          done
 
           # =========================================================
           # Step 6 (gated): Re-encrypt every Secret cluster-wide.
