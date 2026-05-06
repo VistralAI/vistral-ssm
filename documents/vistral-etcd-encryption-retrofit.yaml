@@ -1,0 +1,260 @@
+schemaVersion: "2.2"
+description: |
+  Enable etcd encryption-at-rest on a running control plane (todo.md #47/#51).
+  This is the retrofit path for clusters that already exist — fresh clusters
+  get the same wiring during init-cluster.sh. Idempotent: re-running on a
+  control plane that already has encryption is a no-op.
+
+  Per-control-plane workflow (operator runs SSM Run Command targeting ONE
+  vausk* host at a time, waits for kube-apiserver to come back ready, then
+  moves to the next):
+
+    1. Pull the shared aescbc key from Secrets Manager (created + managed by
+       VistralK8sAutomation CDK stack — vistral-etcd-encryption-key).
+    2. Render /etc/kubernetes/encryption/config.yaml from the template at
+       /opt/vistral-cluster/encryption-policy.yaml.template (mode 0600).
+    3. Backup /etc/kubernetes/manifests/kube-apiserver.yaml.
+    4. Add --encryption-provider-config arg + hostPath volume mount to the
+       static-pod manifest. kubelet picks it up within ~30s and recreates
+       kube-apiserver.
+    5. Wait until the new apiserver pod is Ready on this host.
+    6. (optional, gated on Reencrypt=true) Re-encrypt every Secret cluster-
+       wide via `kubectl get secrets -A -o json | kubectl replace -f -`.
+       Run this ONCE — only after every control plane has been retrofitted.
+       Re-running is harmless (idempotent kubectl replace).
+
+  Verification (operator does this manually, not in the doc):
+    sudo ETCDCTL_API=3 etcdctl \
+      --endpoints=https://127.0.0.1:2379 \
+      --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+      --cert=/etc/kubernetes/pki/etcd/peer.crt \
+      --key=/etc/kubernetes/pki/etcd/peer.key \
+      get /registry/secrets/cvat/cvat-analytics-secret | hexdump -C | head -5
+    Expect "k8s:enc:aescbc:v1:key1" in the leading bytes.
+
+parameters:
+  EncryptionKeySecretId:
+    type: String
+    description: "Secrets Manager secret name or ARN for the etcd aescbc key (32 random bytes, base64 will be applied here)."
+    default: "vistral-etcd-encryption-key"
+  AWSRegion:
+    type: String
+    description: "AWS region for Secrets Manager + kubectl downloads."
+    default: "us-east-1"
+  TemplatePath:
+    type: String
+    description: "Path to the encryption-policy.yaml.template on the control plane."
+    default: "/opt/vistral-cluster/encryption-policy.yaml.template"
+  Reencrypt:
+    type: String
+    description: |
+      Set to "true" to run `kubectl get secrets -A -o json | kubectl replace -f -`
+      AFTER the apiserver is healthy. Only run this on ONE control plane and
+      ONLY after every control plane has been retrofitted. Default false to
+      keep this step explicit (it's the irreversible one).
+    default: "false"
+    allowedValues: ["true", "false"]
+
+mainSteps:
+  - action: aws:runShellScript
+    name: enableEtcdEncryptionAtRest
+    inputs:
+      timeoutSeconds: 1200
+      runCommand:
+        - |
+          #!/bin/bash
+          set -euo pipefail
+          export HOME=/root
+
+          SECRET_ID="{{EncryptionKeySecretId}}"
+          AWS_REGION="{{AWSRegion}}"
+          TEMPLATE="{{TemplatePath}}"
+          REENCRYPT="{{Reencrypt}}"
+
+          ENC_DIR=/etc/kubernetes/encryption
+          ENC_CONFIG="${ENC_DIR}/config.yaml"
+          MANIFEST=/etc/kubernetes/manifests/kube-apiserver.yaml
+          LOG=/var/log/vistral-etcd-encryption-retrofit.log
+          exec > >(tee -a "$LOG") 2>&1
+
+          echo "=============================================="
+          echo "etcd encryption retrofit - $(hostname) - $(date)"
+          echo "=============================================="
+
+          # =========================================================
+          # Guard: only run on control plane hosts.
+          # =========================================================
+          if [ ! -f /etc/kubernetes/admin.conf ]; then
+              echo "Not a control plane (no /etc/kubernetes/admin.conf). Skipping."
+              exit 0
+          fi
+          export KUBECONFIG=/etc/kubernetes/admin.conf
+
+          # =========================================================
+          # Idempotency: skip if encryption is already wired up AND the
+          # apiserver pod is healthy. This is the safety net that lets
+          # the operator re-run the doc safely if a previous invocation
+          # bailed mid-flight.
+          # =========================================================
+          if [ -f "$ENC_CONFIG" ] && grep -q 'encryption-provider-config' "$MANIFEST"; then
+              echo "Encryption already configured on this host."
+              if kubectl --kubeconfig="$KUBECONFIG" \
+                   -n kube-system get pod \
+                   -l component=kube-apiserver \
+                   --field-selector=spec.nodeName="$(hostname | tr '[:upper:]' '[:lower:]')" \
+                   -o jsonpath='{.items[*].status.conditions[?(@.type=="Ready")].status}' 2>/dev/null \
+                   | grep -q True; then
+                  echo "kube-apiserver is Ready. Nothing to do on this host."
+                  if [ "$REENCRYPT" != "true" ]; then
+                      exit 0
+                  fi
+                  echo "Reencrypt=true → continuing to re-encrypt step."
+              else
+                  echo "Manifest is patched but apiserver not Ready. Continuing to wait/repair."
+              fi
+          fi
+
+          # =========================================================
+          # Prereqs.
+          # =========================================================
+          if ! command -v aws >/dev/null 2>&1; then
+              echo "ERROR: aws CLI not installed on $(hostname). Bootstrap should ship it."
+              exit 1
+          fi
+          if [ ! -f "$TEMPLATE" ]; then
+              echo "ERROR: template missing at $TEMPLATE. /opt/vistral-cluster needs to be up to date."
+              echo "Run vistral-cluster-update first, then re-run this doc."
+              exit 1
+          fi
+
+          # =========================================================
+          # Step 1+2: Stage /etc/kubernetes/encryption/config.yaml.
+          # =========================================================
+          mkdir -p "$ENC_DIR"
+          chmod 0700 "$ENC_DIR"
+
+          if [ ! -f "$ENC_CONFIG" ]; then
+              echo "Pulling aescbc key from Secrets Manager: $SECRET_ID"
+              RAW_KEY=$(aws secretsmanager get-secret-value \
+                  --secret-id "$SECRET_ID" \
+                  --region "$AWS_REGION" \
+                  --query SecretString --output text) \
+                  || { echo "ERROR: get-secret-value failed for $SECRET_ID"; exit 1; }
+
+              # k8s aescbc expects 32 raw bytes base64-encoded. CDK's
+              # generateSecretString gave us 32 random ASCII bytes; base64
+              # them here so the encryption config has the form
+              # `secret: <44-char base64>` that aescbc wants. Same shape
+              # as `head -c 32 /dev/urandom | base64`.
+              ENC_KEY=$(printf '%s' "$RAW_KEY" | base64 -w0)
+              unset RAW_KEY
+
+              # `|` is the sed separator (key contains `+`/`=` from base64,
+              # not `|`). Template expects __ENCRYPTION_KEY__ placeholder.
+              sed "s|__ENCRYPTION_KEY__|${ENC_KEY}|" "$TEMPLATE" > "$ENC_CONFIG"
+              unset ENC_KEY
+              chmod 0600 "$ENC_CONFIG"
+              echo "Wrote $ENC_CONFIG"
+          else
+              echo "Reusing existing $ENC_CONFIG"
+          fi
+
+          # =========================================================
+          # Step 3+4: Patch the apiserver static-pod manifest.
+          # kubelet watches this file and recreates the apiserver pod
+          # when its mtime changes — no kubelet restart needed.
+          # =========================================================
+          if ! grep -q 'encryption-provider-config' "$MANIFEST"; then
+              BACKUP="${MANIFEST}.pre-encryption.$(date +%Y%m%d-%H%M%S)"
+              cp "$MANIFEST" "$BACKUP"
+              echo "Backed up manifest → $BACKUP"
+
+              # Insert --encryption-provider-config flag after the
+              # `- kube-apiserver` command line. Indent matches the
+              # existing flags (4 spaces, '- '). Idempotency is enforced
+              # by the grep guard above, so this only runs on first edit.
+              sed -i \
+                '/- kube-apiserver$/a\    - --encryption-provider-config=/etc/kubernetes/encryption/config.yaml' \
+                "$MANIFEST"
+
+              # Add the volume + volumeMount via Python (yaml-aware) so
+              # we don't risk indentation bugs from a sed regex on YAML.
+              # Python3 + PyYAML are present on every control plane (kubelet
+              # depends on them transitively via cloud-init / Ubuntu base).
+              python3 - "$MANIFEST" <<'PY'
+          import sys, yaml, io
+          path = sys.argv[1]
+          with open(path) as f:
+              doc = yaml.safe_load(f)
+          spec = doc["spec"]
+          vols = spec.setdefault("volumes", [])
+          if not any(v.get("name") == "encryption-config" for v in vols):
+              vols.append({
+                  "name": "encryption-config",
+                  "hostPath": {"path": "/etc/kubernetes/encryption", "type": "DirectoryOrCreate"},
+              })
+          mounts = spec["containers"][0].setdefault("volumeMounts", [])
+          if not any(m.get("name") == "encryption-config" for m in mounts):
+              mounts.append({
+                  "name": "encryption-config",
+                  "mountPath": "/etc/kubernetes/encryption",
+                  "readOnly": True,
+              })
+          buf = io.StringIO()
+          yaml.safe_dump(doc, buf, default_flow_style=False, sort_keys=False)
+          with open(path, "w") as f:
+              f.write(buf.getvalue())
+          PY
+              echo "Patched $MANIFEST (flag + volume mount)"
+          else
+              echo "$MANIFEST already references encryption-provider-config — skipping patch"
+          fi
+
+          # =========================================================
+          # Step 5: Wait for kube-apiserver pod on THIS node to come back
+          # Ready. kubelet usually recreates it within 30s of the
+          # manifest mtime change.
+          # =========================================================
+          NODE=$(hostname | tr '[:upper:]' '[:lower:]')
+          echo "Waiting up to 5 min for kube-apiserver on $NODE to become Ready..."
+          DEADLINE=$(( $(date +%s) + 300 ))
+          while [ "$(date +%s)" -lt "$DEADLINE" ]; do
+              if kubectl --kubeconfig="$KUBECONFIG" \
+                   -n kube-system get pod \
+                   -l component=kube-apiserver \
+                   --field-selector=spec.nodeName="$NODE" \
+                   -o jsonpath='{.items[*].status.conditions[?(@.type=="Ready")].status}' 2>/dev/null \
+                   | grep -q True; then
+                  echo "kube-apiserver on $NODE is Ready."
+                  break
+              fi
+              sleep 5
+          done
+          if [ "$(date +%s)" -ge "$DEADLINE" ]; then
+              echo "ERROR: apiserver did not come back Ready within 5 min."
+              echo "Check: kubectl describe pod -n kube-system -l component=kube-apiserver"
+              echo "Manifest backup at ${MANIFEST}.pre-encryption.* — restore if needed."
+              exit 1
+          fi
+
+          # =========================================================
+          # Step 6 (gated): Re-encrypt every Secret cluster-wide.
+          # =========================================================
+          if [ "$REENCRYPT" = "true" ]; then
+              echo "Reencrypt=true — running cluster-wide secret rewrite."
+              # Output goes to /tmp not piped directly so a partial
+              # mid-stream failure doesn't half-replace.
+              SECRETS_DUMP=/tmp/all-secrets.$$.json
+              kubectl --kubeconfig="$KUBECONFIG" \
+                  get secrets -A -o json > "$SECRETS_DUMP"
+              kubectl --kubeconfig="$KUBECONFIG" replace -f "$SECRETS_DUMP"
+              rm -f "$SECRETS_DUMP"
+              echo "Re-encrypt complete."
+          else
+              echo "Reencrypt=false — skipping cluster-wide secret rewrite."
+              echo "Run this doc once with Reencrypt=true after every control plane is retrofitted."
+          fi
+
+          echo "=============================================="
+          echo "etcd encryption retrofit complete on $(hostname) - $(date)"
+          echo "=============================================="
