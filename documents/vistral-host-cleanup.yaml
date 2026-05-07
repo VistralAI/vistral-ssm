@@ -145,6 +145,28 @@ mainSteps:
             fi
           fi
 
+          # ---------- 2c. Raise inotify limits ----------
+          # Default Ubuntu has fs.inotify.max_user_instances=128 which
+          # is too low for a kubernetes worker. Promtail tails every
+          # container's stdout log and needs ~1 instance per log file.
+          # NPD adds another ~5 watches per node. Loki shippers, fluentd,
+          # vector etc all consume instances. 128 → 8192 matches what
+          # most managed kubernetes distros (EKS, GKE, AKS) ship.
+          # Persist via /etc/sysctl.d/ so it survives reboot.
+          INOTIFY_CONF=/etc/sysctl.d/99-vistral-inotify.conf
+          if [[ ! -f "$INOTIFY_CONF" ]] || ! grep -q "^fs.inotify.max_user_instances=8192" "$INOTIFY_CONF"; then
+            echo "Raising fs.inotify limits (was: instances=$(sysctl -n fs.inotify.max_user_instances), watches=$(sysctl -n fs.inotify.max_user_watches))"
+            # Avoid heredoc here — the YAML block scalar needs the script
+            # body at consistent indentation, but a heredoc body must be
+            # at column 0 to write a properly formatted sysctl.d file.
+            # printf with explicit newlines sidesteps both constraints.
+            printf 'fs.inotify.max_user_instances=8192\nfs.inotify.max_user_watches=1048576\n' > "$INOTIFY_CONF"
+            sysctl -p "$INOTIFY_CONF" >/dev/null
+            echo "  now: instances=$(sysctl -n fs.inotify.max_user_instances), watches=$(sysctl -n fs.inotify.max_user_watches)"
+          else
+            echo "fs.inotify limits already raised"
+          fi
+
           # ---------- 3. Remove broken wol-enable.service ----------
           # The pre-fix unit had a malformed ethtool command (the bash
           # `$()` newline-stripping bug in vistral-wol-setup that
