@@ -65,12 +65,6 @@ mainSteps:
               exit 0
           fi
 
-          # P1 #6 hardened guard: a label exists ≠ correct label.
-          # Detect hardware again and only skip if the existing label still
-          # matches what we'd assign now. Otherwise re-label (handles
-          # GPU added/removed, hostname-pattern policy changes).
-          EXISTING=$(kubectl get node "$HOSTNAME" -o jsonpath='{.metadata.labels.vistral\.ai/node-type}' 2>/dev/null || echo "")
-
           # Detect hardware
           HAS_GPU=false
           if command -v lspci &>/dev/null; then
@@ -94,20 +88,18 @@ mainSteps:
 
           echo "Hardware: $HARDWARE, GPU: $HAS_GPU"
 
-          # Determine the label this run *would* set, then compare to existing.
-          if [[ "$HOSTNAME" =~ ^vausk[0-9]+$ ]]; then
-              EXPECTED_TYPE="control-plane"
-          elif [[ "$HOSTNAME" =~ ^vausw[0-9]+$ ]] || [[ "$HOSTNAME" =~ ^vausm[0-9]+$ ]]; then
-              EXPECTED_TYPE="worker"
-          else
-              EXPECTED_TYPE=""
-          fi
-          if [ -n "$EXISTING" ] && [ "$EXISTING" = "$EXPECTED_TYPE" ]; then
-              echo "Node already labeled correctly: node-type=$EXISTING. Skipping."
-              exit 0
-          fi
+          # Note: previous P1 #6 guard exited early when vistral.ai/node-type
+          # was already correct. That skipped the GPU taint step too — and
+          # the taint step is the *only* thing that prevents non-GPU
+          # workloads from landing on GPU workers. Result (todo.md #66):
+          # vausw01 was labelled by an earlier path (k8s-join's embedded
+          # labeller), so this doc never re-ran on it, the taint never
+          # landed, and stateful workloads accumulated on the GPU node.
+          # All kubectl label/taint calls here are idempotent + cheap, so
+          # we just always run them. State Manager invokes this every 30
+          # minutes; the kubectl round-trips are sub-second.
 
-          # Apply labels based on hostname pattern
+          # Apply labels + taint based on hostname pattern
           if [[ "$HOSTNAME" =~ ^vausk[0-9]+$ ]]; then
               echo "Labeling as control plane..."
               kubectl label node "$HOSTNAME" \
@@ -123,7 +115,13 @@ mainSteps:
                   vistral.ai/gpu=$HAS_GPU \
                   --overwrite
 
-              # Taint GPU workers so only GPU workloads schedule on them
+              # Taint GPU workers so only GPU workloads schedule on them.
+              # Standard k8s pattern (nvidia.com/gpu) — gpu-operator and
+              # NVIDIA workloads tolerate this taint by convention; non-GPU
+              # workloads (alertmanager, pushgateway, mongodb, ...) do not,
+              # so they're repelled. Broad-toleration system DaemonSets
+              # (calico-node, kube-proxy, longhorn-manager) tolerate
+              # `Exists` and continue to run here as required.
               if [ "$HAS_GPU" = "true" ]; then
                   kubectl taint nodes "$HOSTNAME" \
                       nvidia.com/gpu=present:NoSchedule \
