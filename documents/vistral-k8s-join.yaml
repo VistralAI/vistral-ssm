@@ -743,8 +743,56 @@ mainSteps:
                   # minutes. The next block polls for the node to reach
                   # Ready independently, so the kubeadm-internal wait is
                   # redundant. (kubeadm v1.33 supports the skip-phase.)
-                  echo "Joining cluster as control plane (skip kubelet-wait-bootstrap; will poll for Ready below)..."
-                  sudo $JOIN_CMD --control-plane --certificate-key "$CERT_KEY" --skip-phases=kubelet-wait-bootstrap
+                  # Skip both `kubelet-wait-bootstrap` and `mark-control-plane`:
+                  # the latter runs immediately after the former and tries
+                  # to label the Node — which doesn't exist yet because
+                  # kubelet TLS bootstrap is still in flight. We apply the
+                  # label ourselves after the poll loop confirms Ready.
+                  echo "Joining cluster as control plane (skip kubelet-wait-bootstrap + mark-control-plane; will apply label after Ready)..."
+                  sudo $JOIN_CMD --control-plane --certificate-key "$CERT_KEY" --skip-phases=kubelet-wait-bootstrap,control-plane-join/mark-control-plane
+
+                  # Repoint bootstrap-kubelet.conf at a peer CP's apiserver.
+                  #
+                  # kubeadm writes bootstrap-kubelet.conf with the LOCAL
+                  # apiserver as its `server:` (e.g. https://<my-ip>:6443).
+                  # The local apiserver was just spun up and depends on
+                  # the local etcd, which is still snapshotting from the
+                  # cluster — it can't validate the bootstrap token until
+                  # etcd is fully synced. Result: kubelet authenticates as
+                  # `system:anonymous`, CSR is rejected as Unauthorized,
+                  # and TLS bootstrap never completes. Symptom seen on
+                  # vausk01 rejoin 2026-05-08 (multiple SSM-doc-failure
+                  # cycles).
+                  #
+                  # Fix: swap the bootstrap target to a healthy peer CP's
+                  # apiserver. Kubelet uses bootstrap-kubelet.conf only
+                  # for the initial CSR; after the first cert is issued,
+                  # it switches to /etc/kubernetes/kubelet.conf (which
+                  # kubeadm wrote with the LB VIP) and rotates from there.
+                  # So the swap is one-shot and self-healing.
+                  echo "Repointing bootstrap-kubelet.conf at a peer CP..."
+                  MY_IP=$(hostname -I | awk '{print $1}')
+                  PEER_CP_IP=""
+                  KUBECONFIG_TMP=/etc/kubernetes/admin.conf
+                  if [ -f "$KUBECONFIG_TMP" ]; then
+                      for ip in $(KUBECONFIG="$KUBECONFIG_TMP" kubectl get nodes -l node-role.kubernetes.io/control-plane -o jsonpath='{range .items[*]}{.status.addresses[?(@.type=="InternalIP")].address}{" "}{end}' 2>/dev/null); do
+                          if [ "$ip" != "$MY_IP" ] && [ -n "$ip" ]; then
+                              # Probe the peer apiserver before committing.
+                              if curl -fsk --max-time 3 "https://${ip}:6443/healthz" >/dev/null 2>&1; then
+                                  PEER_CP_IP="$ip"
+                                  break
+                              fi
+                          fi
+                      done
+                  fi
+                  if [ -n "$PEER_CP_IP" ]; then
+                      echo "  swapping bootstrap-kubelet.conf server: ${MY_IP}:6443 → ${PEER_CP_IP}:6443"
+                      sed -i "s|https://${MY_IP}:6443|https://${PEER_CP_IP}:6443|g" /etc/kubernetes/bootstrap-kubelet.conf
+                      # Force kubelet to re-read with the new endpoint.
+                      systemctl restart kubelet || true
+                  else
+                      echo "  WARN: no healthy peer CP found — leaving bootstrap-kubelet.conf at default (may cause Unauthorized CSR until local etcd fully syncs)"
+                  fi
 
                   # Wait up to 8 minutes for the kubelet to actually
                   # complete TLS bootstrap and register the node. This
@@ -766,6 +814,16 @@ mainSteps:
                           fi
                           sleep 5
                       done
+
+                      # Apply control-plane label + exclude-from-LB label
+                      # (the kubeadm-internal mark-control-plane phase was
+                      # skipped above because the Node didn't exist yet
+                      # when it would have run).
+                      echo "Applying control-plane labels (we skipped kubeadm's mark-control-plane phase)..."
+                      KUBECONFIG="$KUBECONFIG_TMP" kubectl label node "$MY_HOSTNAME" \
+                          node-role.kubernetes.io/control-plane= \
+                          node.kubernetes.io/exclude-from-external-load-balancers= \
+                          --overwrite
                   fi
 
                   # Setup kubectl for this user
