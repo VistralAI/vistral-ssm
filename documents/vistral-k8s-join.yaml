@@ -733,8 +733,40 @@ mainSteps:
                   fi
 
                   # Join as control plane
-                  echo "Joining cluster as control plane..."
-                  sudo $JOIN_CMD --control-plane --certificate-key "$CERT_KEY"
+                  # Skip the kubelet-wait-bootstrap phase — kubeadm's
+                  # built-in 4min timer can lapse before the new etcd
+                  # member is promoted from learner (etcd needs to ship
+                  # the entire snapshot to the new peer; on a busy
+                  # cluster that takes >4min). When the timer trips,
+                  # kubeadm reports failure even though etcd join AND
+                  # kubelet TLS bootstrap WILL complete given a few more
+                  # minutes. The next block polls for the node to reach
+                  # Ready independently, so the kubeadm-internal wait is
+                  # redundant. (kubeadm v1.33 supports the skip-phase.)
+                  echo "Joining cluster as control plane (skip kubelet-wait-bootstrap; will poll for Ready below)..."
+                  sudo $JOIN_CMD --control-plane --certificate-key "$CERT_KEY" --skip-phases=kubelet-wait-bootstrap
+
+                  # Wait up to 8 minutes for the kubelet to actually
+                  # complete TLS bootstrap and register the node. This
+                  # replaces the kubeadm-internal 4min timer with a
+                  # poll loop that's tolerant of slow etcd promotion.
+                  echo "Polling for node Ready (up to 8 min)..."
+                  KUBECONFIG_TMP=/etc/kubernetes/admin.conf
+                  if [ -f "$KUBECONFIG_TMP" ]; then
+                      MY_HOSTNAME=$(hostname | tr '[:upper:]' '[:lower:]')
+                      for i in $(seq 1 96); do
+                          STATUS=$(KUBECONFIG="$KUBECONFIG_TMP" kubectl get node "$MY_HOSTNAME" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || true)
+                          if [ "$STATUS" = "True" ]; then
+                              echo "Node $MY_HOSTNAME is Ready after $((i*5))s"
+                              break
+                          fi
+                          if [ $i -eq 96 ]; then
+                              echo "ERROR: Node $MY_HOSTNAME did not reach Ready within 8min"
+                              exit 1
+                          fi
+                          sleep 5
+                      done
+                  fi
 
                   # Setup kubectl for this user
                   mkdir -p $HOME/.kube
