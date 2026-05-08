@@ -167,6 +167,34 @@ mainSteps:
             echo "fs.inotify limits already raised"
           fi
 
+          # ---------- 2d. Strip autoinstall from GRUB cmdline ----------
+          # CRITICAL latent bug: every Mac mini in this cluster ships with
+          # `GRUB_CMDLINE_LINUX_DEFAULT="autoinstall ds=nocloud;s=/cdrom/ ..."`
+          # left over from the autoinstaller ISO that did the OS install.
+          # Every reboot triggers cloud-init's nocloud datasource to look
+          # for an autoinstall config — when it finds one (the original ISO
+          # autoinstall.yaml is sometimes still on / via the curtin-cleanup
+          # path), cloud-init re-runs the installer and partially wipes the
+          # filesystem (/var/lib/kubelet, /etc/kubernetes, parts of /var).
+          #
+          # We hit this on 2026-05-08 when vausk01 was rebooted to pick up
+          # a kernel downgrade — the new boot ran autoinstall, wiped the
+          # kubeadm state, and required a full re-join to recover.
+          #
+          # Strip `autoinstall ds=nocloud[...]` from the default cmdline
+          # and regen grub. Idempotent: reruns are no-ops once stripped.
+          if grep -q '^GRUB_CMDLINE_LINUX_DEFAULT="autoinstall ds=nocloud' /etc/default/grub; then
+            echo "Found 'autoinstall ds=nocloud' in GRUB cmdline — stripping (would wipe filesystem on next reboot otherwise)"
+            cp /etc/default/grub "/etc/default/grub.pre-fix-$(date +%s)"
+            sed -i 's|^GRUB_CMDLINE_LINUX_DEFAULT="autoinstall ds=nocloud[^"]*|GRUB_CMDLINE_LINUX_DEFAULT="|' /etc/default/grub
+            echo "  before/after:"
+            grep '^GRUB_CMDLINE_LINUX' /etc/default/grub
+            update-grub 2>&1 | tail -3
+            echo "  stripped — autoinstall no longer triggered on boot"
+          else
+            echo "GRUB cmdline already clean (no autoinstall directive)"
+          fi
+
           # ---------- 3. Remove broken wol-enable.service ----------
           # The pre-fix unit had a malformed ethtool command (the bash
           # `$()` newline-stripping bug in vistral-wol-setup that
